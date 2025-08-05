@@ -1,0 +1,10 @@
+/home/ryuzaki/Desktop/C++/clion-2024.3.4/bin/cmake/linux/x64/bin/cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_MAKE_PROGRAM=/home/ryuzaki/Desktop/C++/clion-2024.3.4/bin/ninja/linux/x64/ninja -G Ninja -S /home/ryuzaki/Desktop/untitled -B /home/ryuzaki/Desktop/untitled/cmake-build-debug
+-- OpenCV include dirs: /usr/include/opencv4
+-- OpenCV libs       : opencv_stitching;opencv_alphamat;opencv_aruco;opencv_barcode;opencv_bgsegm;opencv_bioinspired;opencv_ccalib;opencv_dnn_objdetect;opencv_dnn_superres;opencv_dpm;opencv_face;opencv_freetype;opencv_fuzzy;opencv_hdf;opencv_hfs;opencv_img_hash;opencv_intensity_transform;opencv_line_descriptor;opencv_mcc;opencv_quality;opencv_rapid;opencv_reg;opencv_rgbd;opencv_saliency;opencv_shape;opencv_stereo;opencv_structured_light;opencv_phase_unwrapping;opencv_superres;opencv_optflow;opencv_surface_matching;opencv_tracking;opencv_highgui;opencv_datasets;opencv_text;opencv_plot;opencv_ml;opencv_videostab;opencv_videoio;opencv_viz;opencv_wechat_qrcode;opencv_ximgproc;opencv_video;opencv_xobjdetect;opencv_objdetect;opencv_calib3d;opencv_imgcodecs;opencv_features2d;opencv_dnn;opencv_flann;opencv_xphoto;opencv_photo;opencv_imgproc;opencv_core
+-- FFmpeg avutil inc : /usr/include/x86_64-linux-gnu
+-- FFmpeg avcodec inc: /usr/include/x86_64-linux-gnu
+-- FFmpeg avformat inc: /usr/include/x86_64-linux-gnu
+-- FFmpeg swscale inc: /usr/include/x86_64-linux-gnu
+-- Configuring done (0.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/ryuzaki/Desktop/untitled/cmake-build-debug

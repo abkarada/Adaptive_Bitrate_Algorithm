@@ -1,0 +1,3 @@
+/home/ryuzaki/Desktop/untitled/cmake-build-debug/CMakeFiles/camera_ffmpeg.dir
+/home/ryuzaki/Desktop/untitled/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/ryuzaki/Desktop/untitled/cmake-build-debug/CMakeFiles/rebuild_cache.dir
