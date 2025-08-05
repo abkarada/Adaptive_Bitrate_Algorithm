@@ -2,12 +2,12 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
+#include <libavutil/opt.h>
 }
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/highgui.hpp>
 #include <iostream>
-#include <libavutil/opt.h>
 
 using namespace cv;
 using namespace std;
@@ -31,9 +31,7 @@ int main(){
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, HEIGHT);
     cap.set(cv::CAP_PROP_FPS, FPS);
 
-    avcodec_register_all();
-
-    AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
     if (!codec)
     {
         cout << "Codec not found" << endl;
