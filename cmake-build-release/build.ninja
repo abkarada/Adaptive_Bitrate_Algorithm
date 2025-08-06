@@ -51,7 +51,7 @@ build cmake_object_order_depends_target_camera_ffmpeg: phony || .
 
 build CMakeFiles/camera_ffmpeg.dir/main.cpp.o: CXX_COMPILER__camera_ffmpeg_unscanned_Release /home/ryuzaki/Desktop/untitled/main.cpp || cmake_object_order_depends_target_camera_ffmpeg
   DEP_FILE = CMakeFiles/camera_ffmpeg.dir/main.cpp.o.d
-  FLAGS = -O3 -DNDEBUG -std=gnu++11 -fdiagnostics-color=always
+  FLAGS = -O3 -DNDEBUG -std=gnu++20 -fdiagnostics-color=always
   INCLUDES = -isystem /usr/include/opencv4
   OBJECT_DIR = CMakeFiles/camera_ffmpeg.dir
   OBJECT_FILE_DIR = CMakeFiles/camera_ffmpeg.dir

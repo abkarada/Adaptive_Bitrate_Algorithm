@@ -33,16 +33,21 @@ static size_t mtu = 1200;
 using namespace cv;
 using namespace std;
 
-std::vector<std::vector<uint8_t>> slice(const uint8_t* data, size_t size, size_t mtu) {
+std::vector<std::vector<uint8_t>> slice_and_pad(const uint8_t* data, size_t size, size_t mtu) {
     std::vector<std::vector<uint8_t>> chunks;
     size_t offset = 0;
+
     while (offset < size) {
         size_t len = std::min(mtu, size - offset);
-        chunks.emplace_back(data + offset, data + offset + len);
+        std::vector<uint8_t> chunk(mtu, 0); // always full MTU size
+        std::memcpy(chunk.data(), data + offset, len);
+        chunks.emplace_back(std::move(chunk));
         offset += len;
     }
+
     return chunks;
 }
+
 
 
 int main(){
@@ -111,6 +116,7 @@ int main(){
     int fps_counter = 0;
     auto t0 = chrono::high_resolution_clock::now();
 
+    next_frame:
     while(cap.read(frame)){
         fps_counter++;
         frame_count++;
@@ -135,7 +141,7 @@ int main(){
         while (avcodec_receive_packet(ctx, pkt) == 0) {
             int encoded_size = pkt->size;
 
-            auto chunks = slice(pkt->data, pkt->size, mtu);
+            auto chunks = slice_and_pad(pkt->data, pkt->size, mtu);
             cout << "Frame #" << frame_count
                  << " | Raw: " << raw_size << " bytes"
                  << " -> Encoded: " << encoded_size << " bytes"
@@ -143,53 +149,44 @@ int main(){
                  << " | Redundant: " << r
                  << " | Total sendable: " << chunks.size() + r << endl;
 
-            //-->
+            //-->Chunks ı UDP Channelları ile gönder
 
-            if (chunks.size() < k)
-            {
-                cerr <<"Frame is too low"<<endl;
-                av_packet_unref(pkt);
-                continue;
+            int effective_k = chunks.size();
+            if (effective_k < 2) {
+                cerr << "Too small to apply FEC: skipping." << endl;
+                goto send_anyway;
             }
 
-            // 1. Chunkları ptr dizisine dönüştür
-            std::vector<uint8_t*> data_ptrs(k);
-            for (int i = 0; i < k; ++i)
-                data_ptrs[i] = chunks[i].data();
+            // r: parity count = %25 of k, minimum 1, maximum 10
+            int effective_r = std::clamp(effective_k / 4, 1, 10);
 
-            // 2. Her chunk aynı boyda mı kontrol et (ISA-L bunu ister)
+
             size_t chunk_size = chunks[0].size();
-            for (int i = 1; i < k; ++i) {
+            for (int i = 0; i < effective_k; ++i) {
                 if (chunks[i].size() != chunk_size) {
-                    cerr << "Chunk sizes are not uniform!" << endl;
-                    continue;
+                    cerr << "Inconsistent chunk size." << endl;
+                    av_packet_unref(pkt);
+                    goto next_frame;
                 }
             }
 
-            // 3. Redundant chunklar için boş alan ayır
-            std::vector<std::vector<uint8_t>> parity_chunks(r, std::vector<uint8_t>(chunk_size));
-            std::vector<uint8_t*> parity_ptrs(r);
-            for (int i = 0; i < r; ++i)
-                parity_ptrs[i] = parity_chunks[i].data();
+            // Parity için yer ayır
+            std::vector<std::vector<uint8_t>> parity_chunks(effective_r, std::vector<uint8_t>(chunk_size));
+            std::vector<uint8_t*> data_ptrs(effective_k), parity_ptrs(effective_r);
+            for (int i = 0; i < effective_k; ++i) data_ptrs[i] = chunks[i].data();
+            for (int i = 0; i < effective_r; ++i) parity_ptrs[i] = parity_chunks[i].data();
 
-            // 4. Coding matrix oluştur (1 kere yapılabilir)
-            static uint8_t matrix[255 * 255];
-            static uint8_t g_tbls[32 * 1024]; // 32 KB net (güvenli limit)
-            static bool rs_initialized = false;
+            // Her frame için RS matris yeniden oluştur
+            std::vector<uint8_t> matrix((effective_k + effective_r) * effective_k);
+            std::vector<uint8_t> g_tbls(32 * 1024);
 
-            if (!rs_initialized) {
-                gf_gen_rs_matrix(matrix, k + r, k);
-                ec_init_tables(k, r, &matrix[k * k], g_tbls);
-                rs_initialized = true;
-            }
+            gf_gen_rs_matrix(matrix.data(), effective_k + effective_r, effective_k);
+            ec_init_tables(effective_k, effective_r, matrix.data() + effective_k * effective_k, g_tbls.data());
+            ec_encode_data(chunk_size, effective_k, effective_r, g_tbls.data(), data_ptrs.data(), parity_ptrs.data());
 
-
-            // 5. Generator seç
-
-            ec_init_tables(k, r, &matrix[k * k], g_tbls);
-
-            // 6. Encode et
-            ec_encode_data(chunk_size, k, r, g_tbls, data_ptrs.data(), parity_ptrs.data());
+            send_anyway:
+            //Burada gönderme işlemi yapıcam
+            //yani UDP_SEND(&chunk) gibi yapıcam sonuçta chunk a +r bit eklenmişse de eklenmemişse de sorun olmayavak hepsi gönderilecek
 
             av_packet_unref(pkt);
         }
