@@ -120,7 +120,7 @@ int main(){
     while(cap.read(frame)){
         fps_counter++;
         frame_count++;
-
+        std::vector<std::vector<uint8_t>> chunks;
         auto t1 = chrono::high_resolution_clock::now();
         if (chrono::duration_cast<chrono::seconds>(t1 - t0).count() >= 1) {
             cout << "Measured FPS: " << fps_counter << endl;
@@ -141,7 +141,7 @@ int main(){
         while (avcodec_receive_packet(ctx, pkt) == 0) {
             int encoded_size = pkt->size;
 
-            auto chunks = slice_and_pad(pkt->data, pkt->size, mtu);
+            chunks = slice_and_pad(pkt->data, pkt->size, mtu);
             cout << "Frame #" << frame_count
                  << " | Raw: " << raw_size << " bytes"
                  << " -> Encoded: " << encoded_size << " bytes"
@@ -153,8 +153,7 @@ int main(){
 
             int effective_k = chunks.size();
             if (effective_k < 2) {
-                cerr << "Too small to apply FEC: skipping." << endl;
-                goto send_anyway;
+                goto Directly_Send;;
             }
 
             // r: parity count = %25 of k, minimum 1, maximum 10
@@ -183,13 +182,19 @@ int main(){
             gf_gen_rs_matrix(matrix.data(), effective_k + effective_r, effective_k);
             ec_init_tables(effective_k, effective_r, matrix.data() + effective_k * effective_k, g_tbls.data());
             ec_encode_data(chunk_size, effective_k, effective_r, g_tbls.data(), data_ptrs.data(), parity_ptrs.data());
-
-            send_anyway:
+            chunks.insert(chunks.end(),
+              std::make_move_iterator(parity_chunks.begin()),
+              std::make_move_iterator(parity_chunks.end()));
+        }
+            Directly_Send:
             //Burada gönderme işlemi yapıcam
             //yani UDP_SEND(&chunk) gibi yapıcam sonuçta chunk a +r bit eklenmişse de eklenmemişse de sorun olmayavak hepsi gönderilecek
+            //send_udp(chunks[i], i);  // Örnek fonksiyon, slice indexiyle
+            cout <<"Chunk Sended"<<endl;
+
 
             av_packet_unref(pkt);
-        }
+
         imshow("Video", frame);
         if(waitKey(5) >= 0 ){
             break;
