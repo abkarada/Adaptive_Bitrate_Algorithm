@@ -11,33 +11,40 @@ find_package(OpenCV REQUIRED)
 # Find FFmpeg libraries using pkg-config
 find_package(PkgConfig REQUIRED)
 
-# Use pkg-config to get all FFmpeg libraries at once
-pkg_check_modules(FFMPEG REQUIRED 
-    libavutil
-    libavcodec
-    libavformat
-    libswscale
+pkg_check_modules(FFMPEG REQUIRED
+        libavutil
+        libavcodec
+        libavformat
+        libswscale
 )
 
+# ISA-L pkg-config
+pkg_check_modules(ISAL REQUIRED libisal)
+
 # Include directories
-include_directories(${OpenCV_INCLUDE_DIRS})
-include_directories(${FFMPEG_INCLUDE_DIRS})
+include_directories(
+        ${OpenCV_INCLUDE_DIRS}
+        ${FFMPEG_INCLUDE_DIRS}
+        ${ISAL_INCLUDE_DIRS}
+)
+
+# Link directories
+link_directories(
+        ${FFMPEG_LIBRARY_DIRS}
+        ${ISAL_LIBRARY_DIRS}
+)
 
 # Executable target
 add_executable(camera_ffmpeg main.cpp)
 
 # Link libraries
-target_link_libraries(camera_ffmpeg 
-    ${OpenCV_LIBS}
-    ${FFMPEG_LIBRARIES}
+target_link_libraries(camera_ffmpeg
+        ${OpenCV_LIBS}
+        ${FFMPEG_LIBRARIES}
+        ${ISAL_LIBRARIES}
 )
 
 # Set output directory
 set_target_properties(camera_ffmpeg PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
-
-# Display configuration
-message(STATUS "OpenCV found: ${OpenCV_FOUND}")
-message(STATUS "OpenCV version: ${OpenCV_VERSION}")
-message(STATUS "FFmpeg found: ${FFMPEG_FOUND}")

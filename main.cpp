@@ -5,6 +5,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 }
+
+#include <isa-l/erasure_code.h>
 #include <iostream>
 #include <vector>
 #include <cstdint>
@@ -15,8 +17,6 @@ extern "C" {
 #include <opencv2/videoio.hpp>
 #include <opencv2/highgui.hpp>
 
-using namespace cv;
-using namespace std;
 
 #define Device_ID 0
 
@@ -24,7 +24,14 @@ using namespace std;
 #define HEIGHT 720
 #define FPS 30
 
-static size_t mtu = 1200; // Şimdilik sabit bunu da bitrate e göre hesaplıcaz
+
+const int k = 20;
+const int r = 5;
+
+static size_t mtu = 1200;
+
+using namespace cv;
+using namespace std;
 
 std::vector<std::vector<uint8_t>> slice(const uint8_t* data, size_t size, size_t mtu) {
     std::vector<std::vector<uint8_t>> chunks;
@@ -132,9 +139,57 @@ int main(){
             cout << "Frame #" << frame_count
                  << " | Raw: " << raw_size << " bytes"
                  << " -> Encoded: " << encoded_size << " bytes"
-                 <<"->Chunk Count: "<<chunks.size()<<endl;
+                 << "Chunk count: " << chunks.size()
+                 << " | Redundant: " << r
+                 << " | Total sendable: " << chunks.size() + r << endl;
 
             //-->
+
+            if (chunks.size() < k)
+            {
+                cerr <<"Frame is too low"<<endl;
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            // 1. Chunkları ptr dizisine dönüştür
+            std::vector<uint8_t*> data_ptrs(k);
+            for (int i = 0; i < k; ++i)
+                data_ptrs[i] = chunks[i].data();
+
+            // 2. Her chunk aynı boyda mı kontrol et (ISA-L bunu ister)
+            size_t chunk_size = chunks[0].size();
+            for (int i = 1; i < k; ++i) {
+                if (chunks[i].size() != chunk_size) {
+                    cerr << "Chunk sizes are not uniform!" << endl;
+                    continue;
+                }
+            }
+
+            // 3. Redundant chunklar için boş alan ayır
+            std::vector<std::vector<uint8_t>> parity_chunks(r, std::vector<uint8_t>(chunk_size));
+            std::vector<uint8_t*> parity_ptrs(r);
+            for (int i = 0; i < r; ++i)
+                parity_ptrs[i] = parity_chunks[i].data();
+
+            // 4. Coding matrix oluştur (1 kere yapılabilir)
+            static uint8_t matrix[255 * 255];
+            static uint8_t g_tbls[32 * 1024]; // 32 KB net (güvenli limit)
+            static bool rs_initialized = false;
+
+            if (!rs_initialized) {
+                gf_gen_rs_matrix(matrix, k + r, k);
+                ec_init_tables(k, r, &matrix[k * k], g_tbls);
+                rs_initialized = true;
+            }
+
+
+            // 5. Generator seç
+
+            ec_init_tables(k, r, &matrix[k * k], g_tbls);
+
+            // 6. Encode et
+            ec_encode_data(chunk_size, k, r, g_tbls, data_ptrs.data(), parity_ptrs.data());
 
             av_packet_unref(pkt);
         }
