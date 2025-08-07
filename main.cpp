@@ -4,6 +4,9 @@
 #include <cstddef>
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
@@ -11,6 +14,7 @@
 #include <isa-l/erasure_code.h>
 
 #include "adaptive_udp_sender.h"
+#include "udp_port_profiler.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -36,6 +40,21 @@ static size_t mtu = 1200;
 using namespace cv;
 using namespace std;
 
+// === Transmission slice header and FEC builder ===
+#pragma pack(push, 1)
+struct SliceHeader {
+    uint32_t magic = 0xABCD1234;
+    uint32_t frame_id = 0;
+    uint16_t slice_index = 0;
+    uint16_t total_slices = 0; // k + r
+    uint16_t k_data = 0;
+    uint16_t r_parity = 0;
+    uint64_t timestamp_us = 0;
+    uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe
+};
+#pragma pack(pop)
+static_assert(sizeof(SliceHeader) >= 1, "SliceHeader sanity");
+
 std::vector<std::vector<uint8_t>> slice_and_pad(const uint8_t* data, size_t size, size_t mtu) {
     std::vector<std::vector<uint8_t>> chunks;
     size_t offset = 0;
@@ -51,6 +70,85 @@ std::vector<std::vector<uint8_t>> slice_and_pad(const uint8_t* data, size_t size
     return chunks;
 }
 
+struct BuiltSlices {
+    std::vector<std::vector<uint8_t>> data_slices;
+    std::vector<std::vector<uint8_t>> parity_slices;
+    int k = 0;
+    int r = 0;
+};
+
+static inline uint64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::high_resolution_clock::now().time_since_epoch())
+        .count();
+}
+
+BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_bytes, uint32_t frame_id) {
+    BuiltSlices out{};
+    const size_t header_size = sizeof(SliceHeader);
+    if (mtu_bytes <= header_size) return out;
+
+    const size_t payload_size = mtu_bytes - header_size;
+    int k_data = static_cast<int>((size + payload_size - 1) / payload_size);
+    if (k_data <= 0) k_data = 1;
+    int r_parity = std::clamp(k_data / 4, 1, 10);
+    out.k = k_data; out.r = r_parity;
+
+    out.data_slices.resize(k_data);
+    size_t src_off = 0;
+    for (int i = 0; i < k_data; ++i) {
+        out.data_slices[i].assign(mtu_bytes, 0);
+        SliceHeader hdr{};
+        hdr.frame_id = frame_id;
+        hdr.slice_index = static_cast<uint16_t>(i);
+        hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
+        hdr.k_data = static_cast<uint16_t>(k_data);
+        hdr.r_parity = static_cast<uint16_t>(r_parity);
+        hdr.timestamp_us = now_us();
+        hdr.flags = 0;
+        std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
+
+        size_t remain = (src_off < size) ? (size - src_off) : 0;
+        size_t copy_len = std::min(payload_size, remain);
+        if (copy_len > 0) {
+            std::memcpy(out.data_slices[i].data() + header_size, data + src_off, copy_len);
+            src_off += copy_len;
+        }
+    }
+
+    if (k_data >= 2) {
+        std::vector<uint8_t*> data_ptrs(static_cast<size_t>(k_data));
+        for (int i = 0; i < k_data; ++i) data_ptrs[i] = out.data_slices[i].data() + header_size;
+
+        std::vector<std::vector<uint8_t>> parity_payloads(r_parity, std::vector<uint8_t>(payload_size));
+        std::vector<uint8_t*> parity_ptrs(static_cast<size_t>(r_parity));
+        for (int i = 0; i < r_parity; ++i) parity_ptrs[i] = parity_payloads[i].data();
+
+        std::vector<uint8_t> matrix(static_cast<size_t>(k_data + r_parity) * static_cast<size_t>(k_data));
+        std::vector<uint8_t> g_tbls(32 * 1024);
+        gf_gen_rs_matrix(matrix.data(), k_data + r_parity, k_data);
+        ec_init_tables(k_data, r_parity, matrix.data() + k_data * k_data, g_tbls.data());
+        ec_encode_data(static_cast<int>(payload_size), k_data, r_parity, g_tbls.data(), data_ptrs.data(), parity_ptrs.data());
+
+        out.parity_slices.resize(r_parity);
+        for (int i = 0; i < r_parity; ++i) {
+            out.parity_slices[i].assign(mtu_bytes, 0);
+            SliceHeader hdr{};
+            hdr.frame_id = frame_id;
+            hdr.slice_index = static_cast<uint16_t>(k_data + i);
+            hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
+            hdr.k_data = static_cast<uint16_t>(k_data);
+            hdr.r_parity = static_cast<uint16_t>(r_parity);
+            hdr.timestamp_us = now_us();
+            hdr.flags = 0x01; // parity
+            std::memcpy(out.parity_slices[i].data(), &hdr, sizeof(SliceHeader));
+            std::memcpy(out.parity_slices[i].data() + header_size, parity_payloads[i].data(), payload_size);
+        }
+    }
+
+    return out;
+}
+
 
 
 int main(){
@@ -64,10 +162,20 @@ int main(){
 
     AdaptiveUDPSender udp_sender(receiver_ip, receiver_ports);
 
+    // default redundancy for data slices
     udp_sender.enable_redundancy(2);
 
-    std::vector<UDPChannelStat> stats = {}; // güncel ölçüm verileri
-    udp_sender.set_profiles(stats);
+    // live profiler thread to feed sender with channel stats
+    UDPPortProfiler profiler(receiver_ip, receiver_ports);
+    std::atomic<bool> run_profiler{true};
+    std::thread profiler_thread([&](){
+        while (run_profiler.load()) {
+            profiler.send_probes();
+            profiler.receive_replies_epoll(150);
+            udp_sender.set_profiles(profiler.get_stats());
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+    });
 
 
     cap.open(Device_ID, cv::CAP_V4L2);
@@ -94,7 +202,7 @@ int main(){
     ctx->time_base = AVRational{1, FPS};
     ctx->framerate = AVRational{FPS, 1};
     ctx->gop_size = 10;
-    ctx->max_b_frames = 1;
+    ctx->max_b_frames = 0;
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->rc_buffer_size = bitrate;
     ctx->rc_max_rate    = bitrate;
@@ -103,7 +211,8 @@ int main(){
     ctx->thread_type = FF_THREAD_FRAME;
 
     av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
-    av_opt_set(ctx->priv_data, "tune",   "film", 0);
+    av_opt_set(ctx->priv_data, "tune",   "zerolatency", 0);
+    av_opt_set_int(ctx->priv_data, "rc_lookahead", 0, 0);
 
     int encoder_API = avcodec_open2(ctx, codec, nullptr);
     if (encoder_API < 0)
@@ -130,7 +239,6 @@ int main(){
     int fps_counter = 0;
     auto t0 = chrono::high_resolution_clock::now();
 
-    next_frame:
     while(cap.read(frame)){
         fps_counter++;
         frame_count++;
@@ -155,60 +263,27 @@ int main(){
         while (avcodec_receive_packet(ctx, pkt) == 0) {
             int encoded_size = pkt->size;
 
-            chunks = slice_and_pad(pkt->data, pkt->size, mtu);
+            BuiltSlices built = build_slices_with_fec(pkt->data, static_cast<size_t>(pkt->size), mtu, static_cast<uint32_t>(frame_count));
+
             cout << "Frame #" << frame_count
                  << " | Raw: " << raw_size << " bytes"
                  << " -> Encoded: " << encoded_size << " bytes"
-                 << "Chunk count: " << chunks.size()
-                 << " | Redundant: " << r
-                 << " | Total sendable: " << chunks.size() + r << endl;
+                 << " | k=" << built.k
+                 << " r=" << built.r
+                 << " | total=" << (built.k + built.r)
+                 << endl;
 
-            //-->Chunks ı UDP Channelları ile gönder
-            udp_sender.send_slices(chunks);
-
-            int effective_k = chunks.size();
-            if (effective_k < 2) {
-                goto Directly_Send;;
+            if (!built.data_slices.empty()) {
+                udp_sender.send_slices(built.data_slices);
             }
-
-            // r: parity count = %25 of k, minimum 1, maximum 10
-            int effective_r = std::clamp(effective_k / 4, 1, 10);
-
-
-            size_t chunk_size = chunks[0].size();
-            for (int i = 0; i < effective_k; ++i) {
-                if (chunks[i].size() != chunk_size) {
-                    cerr << "Inconsistent chunk size." << endl;
-                    av_packet_unref(pkt);
-                    goto next_frame;
-                }
+            if (!built.parity_slices.empty()) {
+                udp_sender.enable_redundancy(1);
+                udp_sender.send_slices(built.parity_slices);
+                udp_sender.enable_redundancy(2);
             }
-
-            // Parity için yer ayır
-            std::vector<std::vector<uint8_t>> parity_chunks(effective_r, std::vector<uint8_t>(chunk_size));
-            std::vector<uint8_t*> data_ptrs(effective_k), parity_ptrs(effective_r);
-            for (int i = 0; i < effective_k; ++i) data_ptrs[i] = chunks[i].data();
-            for (int i = 0; i < effective_r; ++i) parity_ptrs[i] = parity_chunks[i].data();
-
-            // Her frame için RS matris yeniden oluştur
-            std::vector<uint8_t> matrix((effective_k + effective_r) * effective_k);
-            std::vector<uint8_t> g_tbls(32 * 1024);
-
-            gf_gen_rs_matrix(matrix.data(), effective_k + effective_r, effective_k);
-            ec_init_tables(effective_k, effective_r, matrix.data() + effective_k * effective_k, g_tbls.data());
-            ec_encode_data(chunk_size, effective_k, effective_r, g_tbls.data(), data_ptrs.data(), parity_ptrs.data());
-            chunks.insert(chunks.end(),
-              std::make_move_iterator(parity_chunks.begin()),
-              std::make_move_iterator(parity_chunks.end()));
-        }
-            Directly_Send:
-            //Burada gönderme işlemi yapıcam
-            //yani UDP_SEND(&chunk) gibi yapıcam sonuçta chunk a +r bit eklenmişse de eklenmemişse de sorun olmayavak hepsi gönderilecek
-            //send_udp(chunks[i], i);  // Örnek fonksiyon, slice indexiyle
-            cout <<"Chunk Sended"<<endl;
-
 
             av_packet_unref(pkt);
+        }
 
         imshow("Video", frame);
         if(waitKey(5) >= 0 ){
@@ -222,6 +297,10 @@ int main(){
     avcodec_free_context(&ctx);
     cap.release();
     destroyAllWindows();
+
+    // stop profiler thread
+    run_profiler.store(false);
+    if (profiler_thread.joinable()) profiler_thread.join();
 
     return 0;
 

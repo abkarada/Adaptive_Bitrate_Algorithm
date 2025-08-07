@@ -10,6 +10,7 @@ find_package(OpenCV REQUIRED)
 
 # Find FFmpeg libraries using pkg-config
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 
 pkg_check_modules(FFMPEG REQUIRED
         libavutil
@@ -45,6 +46,7 @@ target_link_libraries(camera_ffmpeg
         ${OpenCV_LIBS}
         ${FFMPEG_LIBRARIES}
         ${ISAL_LIBRARIES}
+        Threads::Threads
 )
 
 # Set output directory
