@@ -15,7 +15,8 @@
 					"source" : ".",
 					"targetIndexes" : 
 					[
-						0
+						0,
+						1
 					]
 				}
 			],
@@ -30,7 +31,8 @@
 					"name" : "CameraFFmpeg",
 					"targetIndexes" : 
 					[
-						0
+						0,
+						1
 					]
 				}
 			],
@@ -41,6 +43,13 @@
 					"id" : "camera_ffmpeg::@6890427a1f51a3e7e1df",
 					"jsonFile" : "target-camera_ffmpeg-Release-8ee39fbd611ef46f1713.json",
 					"name" : "camera_ffmpeg",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "nova_receiver::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-nova_receiver-Release-9388c1df5bca89e41aec.json",
+					"name" : "nova_receiver",
 					"projectIndex" : 0
 				}
 			]

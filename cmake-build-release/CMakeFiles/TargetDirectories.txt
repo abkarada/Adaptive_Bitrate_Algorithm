@@ -1,3 +1,4 @@
 /home/ryuzaki/Desktop/untitled/cmake-build-release/CMakeFiles/camera_ffmpeg.dir
+/home/ryuzaki/Desktop/untitled/cmake-build-release/CMakeFiles/nova_receiver.dir
 /home/ryuzaki/Desktop/untitled/cmake-build-release/CMakeFiles/edit_cache.dir
 /home/ryuzaki/Desktop/untitled/cmake-build-release/CMakeFiles/rebuild_cache.dir

@@ -49,6 +49,7 @@ struct SliceHeader {
     uint16_t total_slices = 0; // k + r
     uint16_t k_data = 0;
     uint16_t r_parity = 0;
+    uint32_t total_frame_bytes = 0; // encoded size of this block
     uint64_t timestamp_us = 0;
     uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe
 };
@@ -104,6 +105,7 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
         hdr.k_data = static_cast<uint16_t>(k_data);
         hdr.r_parity = static_cast<uint16_t>(r_parity);
+        hdr.total_frame_bytes = static_cast<uint32_t>(size);
         hdr.timestamp_us = now_us();
         hdr.flags = 0;
         std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
@@ -139,6 +141,7 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
             hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
             hdr.k_data = static_cast<uint16_t>(k_data);
             hdr.r_parity = static_cast<uint16_t>(r_parity);
+            hdr.total_frame_bytes = static_cast<uint32_t>(size);
             hdr.timestamp_us = now_us();
             hdr.flags = 0x01; // parity
             std::memcpy(out.parity_slices[i].data(), &hdr, sizeof(SliceHeader));
