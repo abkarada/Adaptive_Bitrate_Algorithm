@@ -1,3 +1,17 @@
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <cstddef>
+
+#include <algorithm>
+
+#include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/highgui.hpp>
+#include <isa-l/erasure_code.h>
+
+#include "adaptive_udp_sender.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -5,17 +19,6 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 }
-
-#include <isa-l/erasure_code.h>
-#include <iostream>
-#include <vector>
-#include <cstdint>
-#include <algorithm>
-#include <cstddef>
-
-#include <opencv2/core.hpp>
-#include <opencv2/videoio.hpp>
-#include <opencv2/highgui.hpp>
 
 
 #define Device_ID 0
@@ -55,6 +58,17 @@ int main(){
     VideoCapture cap;
     int bitrate = 400000;//->Siktiğimin şeyini Adaptive Yapıcam sonra
     int64_t counter = 0;
+
+    std::string receiver_ip = "192.168.1.100"; // Gerçek hedefin IP’si
+    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002, 4003, 4004};
+
+    AdaptiveUDPSender udp_sender(receiver_ip, receiver_ports);
+
+    udp_sender.enable_redundancy(2);
+
+    std::vector<UDPChannelStat> stats = {}; // güncel ölçüm verileri
+    udp_sender.set_profiles(stats);
+
 
     cap.open(Device_ID, cv::CAP_V4L2);
     if (!cap.isOpened()) {
@@ -150,6 +164,7 @@ int main(){
                  << " | Total sendable: " << chunks.size() + r << endl;
 
             //-->Chunks ı UDP Channelları ile gönder
+            udp_sender.send_slices(chunks);
 
             int effective_k = chunks.size();
             if (effective_k < 2) {
