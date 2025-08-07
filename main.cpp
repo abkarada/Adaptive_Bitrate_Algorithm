@@ -20,8 +20,8 @@ extern "C" {
 
 #define Device_ID 0
 
-#define WIDTH 1280
-#define HEIGHT 720
+#define WIDTH 640
+#define HEIGHT 480
 #define FPS 30
 
 
@@ -63,8 +63,8 @@ int main(){
     }
     // Önce dört‐character code’u MJPG olarak ayarlayın
     cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('M','J','P','G'));
-    cap.set(CAP_PROP_FRAME_WIDTH, 1280);
-    cap.set(CAP_PROP_FRAME_HEIGHT, 720);
+    cap.set(CAP_PROP_FRAME_WIDTH, WIDTH);
+    cap.set(CAP_PROP_FRAME_HEIGHT, HEIGHT);
     cap.set(CAP_PROP_FPS, FPS);
 
     const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);

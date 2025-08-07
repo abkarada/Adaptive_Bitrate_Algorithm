@@ -35,7 +35,9 @@ link_directories(
 )
 
 # Executable target
-add_executable(camera_ffmpeg main.cpp)
+add_executable(camera_ffmpeg main.cpp
+        udp_port_profiler.h
+)
 
 # Link libraries
 target_link_libraries(camera_ffmpeg
