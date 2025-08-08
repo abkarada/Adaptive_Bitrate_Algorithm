@@ -207,8 +207,9 @@ void AdaptiveUDPSender::send_slices(const std::vector<std::vector<uint8_t>>& chu
 
 void AdaptiveUDPSender::enable_redundancy(int redundancy_count) {
     if (redundancy_count < 1) redundancy_count = 1;
-    if (redundancy_count > tunnels_.size()) redundancy_count = tunnels_.size();
-    redundancy = redundancy_count;
+    if (redundancy_count > static_cast<int>(tunnels_.size())) redundancy_count = static_cast<int>(tunnels_.size());
+    // Tek tünelde clone göndermek aynı yola yük bindirir; kapat
+    if (tunnels_.size() <= 1) redundancy = 1; else redundancy = redundancy_count;
 }
 
 void AdaptiveUDPSender::monitor_heartbeat() {

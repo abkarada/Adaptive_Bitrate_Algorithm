@@ -198,7 +198,7 @@ static void print_usage_sender(const char* prog) {
 int main(int argc, char** argv){
     Mat frame;
     VideoCapture cap;
-    int bitrate = 800000; // initial target bitrate (bps)
+    int bitrate = 1200000; // higher initial target bitrate (bps)
     std::atomic<int> target_bitrate{bitrate};
     int64_t counter = 0;
 
@@ -271,19 +271,21 @@ int main(int argc, char** argv){
 
             // simple bitrate adaptation based on average loss
             double loss_sum = 0.0;
-            for (const auto& s : stats) loss_sum += s.packet_loss;
+            double rtt_sum = 0.0;
+            for (const auto& s : stats) { loss_sum += s.packet_loss; rtt_sum += s.avg_rtt_ms; }
             double avg_loss = stats.empty() ? 0.0 : loss_sum / stats.size();
+            double avg_rtt = stats.empty() ? 0.0 : rtt_sum / stats.size();
+
             int cur = target_bitrate.load();
             int new_bitrate = cur;
-            if (avg_loss > 0.2) {
-                new_bitrate = std::max(cur * 80 / 100, 300000); // -20 %
-            } else if (avg_loss < 0.02) {
-                new_bitrate = std::min(cur * 110 / 100, 2000000); // +10 %
-            }
-            // choose redundancy based on loss
-            int new_redundancy = 1;
-            if (avg_loss > 0.05) new_redundancy = 2;
-            if (avg_loss > 0.15) new_redundancy = 3;
+
+            // Loss odaklı AMA alt limite sabitleyen kontrol: yüksek kaliteyi koru
+            if (avg_loss > 0.20) new_bitrate = std::max(cur * 85 / 100, 800000); // -15% ama 800kbps altına düşme
+            else if (avg_loss > 0.10) new_bitrate = std::max(cur * 90 / 100, 900000);
+            else if (avg_loss < 0.03 && avg_rtt < 60) new_bitrate = std::min(cur * 112 / 100, 2500000);
+
+            // Tek kanalda clone = 1; çok kanalda kayba göre 1..3
+            int new_redundancy = (receiver_ports.size() > 1) ? (avg_loss > 0.15 ? 3 : (avg_loss > 0.05 ? 2 : 1)) : 1;
             udp_sender.enable_redundancy(new_redundancy);
 
             if (new_bitrate != cur) target_bitrate.store(new_bitrate);
@@ -317,16 +319,16 @@ int main(int argc, char** argv){
     ctx->height = HEIGHT;
     ctx->time_base = AVRational{1, FPS};
     ctx->framerate = AVRational{FPS, 1};
-    ctx->gop_size = 20; // daha uzun GOP ile I-frame aralığı net
+    ctx->gop_size = 30; // hareketli sahnelerde daha sık IDR için 1 saniyeye yakın
     ctx->max_b_frames = 0;
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    ctx->rc_buffer_size = current_bitrate;
-    ctx->rc_max_rate    = current_bitrate;
-    ctx->rc_min_rate    = current_bitrate;
+    ctx->rc_buffer_size = current_bitrate * 2;
+    ctx->rc_max_rate    = current_bitrate * 2;
+    ctx->rc_min_rate    = std::max(current_bitrate / 2, 400000);
     ctx->thread_count = 16;
     ctx->thread_type = FF_THREAD_FRAME;
 
-    av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
+    av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
     av_opt_set(ctx->priv_data, "tune",   "zerolatency", 0);
     av_opt_set_int(ctx->priv_data, "rc_lookahead", 0, 0);
     av_opt_set(ctx->priv_data, "repeat-headers", "1", 0);
@@ -374,13 +376,13 @@ int main(int argc, char** argv){
     }
 
     while(cap.read(frame)){
-        // dynamic bitrate adjustment
+        // dynamic bitrate adjustment (conservative: keep high floor)
         if (target_bitrate.load() != current_bitrate) {
             current_bitrate = target_bitrate.load();
             ctx->bit_rate = current_bitrate;
-            ctx->rc_buffer_size = current_bitrate;
-            ctx->rc_max_rate = current_bitrate;
-            ctx->rc_min_rate = current_bitrate;
+            ctx->rc_buffer_size = current_bitrate * 2;
+            ctx->rc_max_rate = current_bitrate * 2;
+            ctx->rc_min_rate = std::max(current_bitrate / 2, 400000);
             av_opt_set_int(ctx->priv_data, "b", current_bitrate, 0);
             av_opt_set_int(ctx->priv_data, "vbv-maxrate", current_bitrate, 0);
             av_opt_set_int(ctx->priv_data, "vbv-bufsize", current_bitrate, 0);
