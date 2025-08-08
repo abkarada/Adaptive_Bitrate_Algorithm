@@ -43,6 +43,7 @@ struct SliceHeader {
     uint32_t total_frame_bytes;// original encoded size
     uint64_t timestamp_us;     // sender ts
     uint8_t  flags;            // bit0 parity
+    uint32_t checksum;         // FNV-1a over payload
 };
 #pragma pack(pop)
 
@@ -340,13 +341,16 @@ int main(int argc, char** argv) {
             if (sh.slice_index < fb.k) {
                 size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
                 std::memcpy(fb.data_blocks[sh.slice_index].data(), payload, copy_len);
-                fb.data_present[sh.slice_index] = 1;
+                // checksum validation
+                uint32_t h = 2166136261u; for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.data_blocks[sh.slice_index][i]; h *= 16777619u; }
+                if (h == sh.checksum) fb.data_present[sh.slice_index] = 1;
             } else {
                 uint16_t pi = static_cast<uint16_t>(sh.slice_index - fb.k);
                 if (pi < fb.r) {
                     size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
                     std::memcpy(fb.parity_blocks[pi].data(), payload, copy_len);
-                    fb.parity_present[pi] = 1;
+                    uint32_t h = 2166136261u; for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.parity_blocks[pi][i]; h *= 16777619u; }
+                    if (h == sh.checksum) fb.parity_present[pi] = 1;
                 }
             }
 

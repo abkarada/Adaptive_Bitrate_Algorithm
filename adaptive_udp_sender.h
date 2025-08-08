@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <thread>
+#include <mutex>
 #include "udp_port_profiler.h"
 
 
@@ -30,6 +31,7 @@ public:
     AdaptiveUDPSender(const std::string& ip, const std::vector<uint16_t>& remote_ports);
     void set_profiles(const std::vector<UDPChannelStat>& stats);
     void send_slices(const std::vector<std::vector<uint8_t>>& chunks);
+    void send_slices_parallel(const std::vector<std::vector<uint8_t>>& chunks, int max_threads = 0);
     void monitor_heartbeat();
     void enable_redundancy(int redundancy_count); // slice başına kaç clone gönderilecek?
 
@@ -38,10 +40,13 @@ private:
     std::vector<Tunnel> tunnels_;
     size_t rr_index_ = 0;
     int redundancy = 1; // her slice kaç porttan gidecek (1 = clone yok, 2 = clone)
+    std::mutex send_mtx_;
 
     int select_best_port_index();
     void send_slice(const std::vector<uint8_t>& slice, int tunnel_index);
     int select_weighted_port_index(const std::vector<int>& exclude_indices, bool favor_diversity);
+    // Scatter: farklı slice gruplarını farklı tünellere paylaştır
+    void scatter_slices(const std::vector<std::vector<uint8_t>>& chunks);
 };
 
 AdaptiveUDPSender::AdaptiveUDPSender(const std::string& ip, const std::vector<uint16_t>& remote_ports)
@@ -213,6 +218,66 @@ void AdaptiveUDPSender::send_slices(const std::vector<std::vector<uint8_t>>& chu
             send_slice(slice, port_index);
             used_ports.push_back(port_index);
         }
+    }
+}
+void AdaptiveUDPSender::send_slices_parallel(const std::vector<std::vector<uint8_t>>& chunks, int max_threads) {
+    if (chunks.empty()) return;
+    size_t nthreads = tunnels_.empty() ? 1 : std::min<size_t>(tunnels_.size(), 4);
+    if (max_threads > 0) nthreads = std::min<size_t>(nthreads, static_cast<size_t>(max_threads));
+    if (nthreads <= 1) { send_slices(chunks); return; }
+
+    auto worker = [&](size_t start_idx) {
+        struct SliceHeaderLocal {
+            uint32_t magic, frame_id; uint16_t slice_index, total_slices, k_data, r_parity, payload_bytes; uint32_t total_frame_bytes; uint64_t ts; uint8_t flags; uint32_t checksum;
+        };
+        for (size_t i = start_idx; i < chunks.size(); i += nthreads) {
+            const auto& slice = chunks[i];
+            bool is_parity = false;
+            if (slice.size() >= sizeof(SliceHeaderLocal)) {
+                SliceHeaderLocal hdr{}; std::memcpy(&hdr, slice.data(), sizeof(SliceHeaderLocal));
+                is_parity = (hdr.flags & 0x01) != 0;
+            }
+            std::vector<int> used_ports;
+            int clones = 1;
+            {
+                std::lock_guard<std::mutex> lk(send_mtx_);
+                clones = std::min<int>(redundancy, static_cast<int>(tunnels_.size()));
+            }
+            for (int c = 0; c < clones; ++c) {
+                int port_index;
+                {
+                    std::lock_guard<std::mutex> lk(send_mtx_);
+                    port_index = select_weighted_port_index(used_ports, /*favor_diversity*/ true);
+                    if (port_index < 0) port_index = select_best_port_index();
+                    if (is_parity && !tunnels_.empty()) {
+                        int best = select_best_port_index();
+                        if (port_index == best) port_index = (port_index + 1) % static_cast<int>(tunnels_.size());
+                    }
+                }
+                send_slice(slice, port_index);
+                used_ports.push_back(port_index);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (size_t t = 0; t < nthreads; ++t) threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+}
+
+// Basit scatter: slice_index mod tunnel_count ile dağıt, ağırlıklandırmayla ayarla
+void AdaptiveUDPSender::scatter_slices(const std::vector<std::vector<uint8_t>>& chunks) {
+    if (tunnels_.empty()) return;
+    struct SliceHeaderLocal { uint32_t magic, frame_id; uint16_t slice_index, total_slices, k_data, r_parity, payload_bytes; uint32_t total_frame_bytes; uint64_t ts; uint8_t flags; uint32_t checksum; };
+    for (const auto& slice : chunks) {
+        int port_index = select_best_port_index();
+        if (slice.size() >= sizeof(SliceHeaderLocal)) {
+            SliceHeaderLocal hdr{}; std::memcpy(&hdr, slice.data(), sizeof(SliceHeaderLocal));
+            // slice index’e göre round-robin kaydırma
+            if (!tunnels_.empty()) port_index = static_cast<int>(hdr.slice_index % tunnels_.size());
+        }
+        send_slice(slice, port_index);
     }
 }
 

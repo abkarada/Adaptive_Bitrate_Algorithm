@@ -62,6 +62,7 @@ struct SliceHeader {
     uint32_t total_frame_bytes = 0; // encoded size of this block
     uint64_t timestamp_us = 0;
     uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe
+    uint32_t checksum = 0; // FNV-1a over payload_bytes
 };
 #pragma pack(pop)
 static_assert(sizeof(SliceHeader) >= 1, "SliceHeader sanity");
@@ -118,6 +119,12 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
 
     out.k = k_data; out.r = r_parity;
 
+    auto fnv1a = [](const uint8_t* p, size_t n){
+        uint32_t h = 2166136261u;
+        for (size_t i=0;i<n;++i){ h ^= p[i]; h *= 16777619u; }
+        return h;
+    };
+
     out.data_slices.resize(k_data);
     size_t src_off = 0;
     for (int i = 0; i < k_data; ++i) {
@@ -132,13 +139,20 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         hdr.total_frame_bytes = static_cast<uint32_t>(size);
         hdr.timestamp_us = now_us();
         hdr.flags = is_keyframe ? 0x02 : 0x00; // bit1: keyframe
+        // compute checksum over payload area we will fill
+        // first write header, then payload, then update checksum
         std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
 
         size_t remain = (src_off < size) ? (size - src_off) : 0;
         size_t copy_len = std::min(payload_size, remain);
         if (copy_len > 0) {
             std::memcpy(out.data_slices[i].data() + header_size, data + src_off, copy_len);
+            hdr.checksum = fnv1a(out.data_slices[i].data() + header_size, payload_size);
+            std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
             src_off += copy_len;
+        } else {
+            hdr.checksum = fnv1a(out.data_slices[i].data() + header_size, payload_size);
+            std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
         }
     }
 
@@ -171,6 +185,8 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
             hdr.flags = static_cast<uint8_t>(0x01 | (is_keyframe ? 0x02 : 0x00)); // parity + keyframe
             std::memcpy(out.parity_slices[i].data(), &hdr, sizeof(SliceHeader));
             std::memcpy(out.parity_slices[i].data() + header_size, parity_payloads[i].data(), payload_size);
+            hdr.checksum = fnv1a(out.parity_slices[i].data() + header_size, payload_size);
+            std::memcpy(out.parity_slices[i].data(), &hdr, sizeof(SliceHeader));
         }
     }
 
@@ -433,7 +449,6 @@ int main(int argc, char** argv){
                         send_data = pkt_filtered->data;
                         send_size = static_cast<size_t>(pkt_filtered->size);
                         is_key = (pkt_filtered->flags & AV_PKT_FLAG_KEY) != 0;
-
                         BuiltSlices built = build_slices_with_fec(send_data,
                                                                  send_size,
                                                                  mtu,
@@ -446,8 +461,9 @@ int main(int argc, char** argv){
                              << " r=" << built.r
                              << " | total=" << (built.k + built.r)
                              << endl;
+                        // Scatter data slices deterministically; parity slices weighted
                         if (!built.data_slices.empty()) {
-                            for(auto &sl: built.data_slices) packet_q.push(Packet{std::move(sl)});
+                            udp_sender.send_slices_parallel(built.data_slices);
                         }
                         if (!built.parity_slices.empty()) {
                             for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
@@ -468,9 +484,7 @@ int main(int argc, char** argv){
                      << " r=" << built.r
                      << " | total=" << (built.k + built.r)
                      << endl;
-                if (!built.data_slices.empty()) {
-                    for(auto &sl: built.data_slices) packet_q.push(Packet{std::move(sl)});
-                }
+                if (!built.data_slices.empty()) udp_sender.send_slices_parallel(built.data_slices);
                 if (!built.parity_slices.empty()) {
                     for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
                 }
