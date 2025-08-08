@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <queue>
+#include <condition_variable>
 #include <sstream>
 #include <string>
 
@@ -209,7 +211,30 @@ int main(int argc, char** argv){
     // default redundancy for data slices
     udp_sender.enable_redundancy(2);
 
+    // thread-safe queue for slice buffers
+    struct Packet {
+        std::vector<uint8_t> data;
+    };
+    class PacketQ {
+        std::queue<Packet> q; std::mutex m; std::condition_variable cv;
+    public:
+        void push(Packet &&p){ std::lock_guard<std::mutex> lk(m); q.push(std::move(p)); cv.notify_one(); }
+        bool pop(Packet &out){ std::unique_lock<std::mutex> lk(m); cv.wait(lk,[&]{return !q.empty();}); out = std::move(q.front()); q.pop(); return true; }
+    } packet_q;
+
     // live profiler thread to feed sender with channel stats
+    std::atomic<bool> run_sender{true};
+    std::thread sender_thread([&](){
+        Packet pktv;
+        while(true){
+            packet_q.pop(pktv);
+            if(!run_sender.load() && pktv.data.empty()) break;
+            if(pktv.data.empty()) continue;
+            std::vector<std::vector<uint8_t>> one{std::move(pktv.data)};
+            udp_sender.send_slices(one);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
     UDPPortProfiler profiler(receiver_ip, receiver_ports);
     std::atomic<bool> run_profiler{true};
     std::thread profiler_thread([&](){
@@ -345,10 +370,10 @@ int main(int argc, char** argv){
                  << endl;
 
             if (!built.data_slices.empty()) {
-                udp_sender.send_slices(built.data_slices);
+                for(auto &sl: built.data_slices) packet_q.push(Packet{std::move(sl)});
             }
             if (!built.parity_slices.empty()) {
-                udp_sender.send_slices(built.parity_slices);
+                for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
             }
 
             av_packet_unref(pkt);
@@ -369,6 +394,9 @@ int main(int argc, char** argv){
 
     // stop profiler thread
     run_profiler.store(false);
+    run_sender.store(false);
+    packet_q.push(Packet{}); // unblock
+    if (sender_thread.joinable()) sender_thread.join();
     if (profiler_thread.joinable()) profiler_thread.join();
 
     return 0;
