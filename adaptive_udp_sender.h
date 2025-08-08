@@ -174,49 +174,28 @@ int AdaptiveUDPSender::select_weighted_port_index(const std::vector<int>& exclud
 }
 
 void AdaptiveUDPSender::send_slices(const std::vector<std::vector<uint8_t>>& chunks) {
-    // We will parse SliceHeader flags to diversify data vs parity placement
-    struct SliceHeaderLocal {
-        uint32_t magic;
-        uint32_t frame_id;
-        uint16_t slice_index;
-        uint16_t total_slices;
-        uint16_t k_data;
-        uint16_t r_parity;
-        uint32_t total_frame_bytes;
-        uint64_t timestamp_us;
-        uint8_t  flags;
-    };
-
-    for (const auto& slice : chunks) {
-        bool is_parity = false;
-        if (slice.size() >= sizeof(SliceHeaderLocal)) {
-            SliceHeaderLocal hdr{};
-            std::memcpy(&hdr, slice.data(), sizeof(SliceHeaderLocal));
-            is_parity = (hdr.flags & 0x01) != 0;
-        }
-
-        std::vector<int> used_ports;
-        int clones = std::min<int>(redundancy, static_cast<int>(tunnels_.size()));
-        for (int i = 0; i < clones; ++i) {
-            int port_index = select_weighted_port_index(used_ports, /*favor_diversity*/ true);
-            if (port_index < 0) port_index = select_best_port_index();
-
-            // Ensure data/parity are diversified across different paths
-            // If parity, try to avoid the absolute best port to keep independence
-            if (is_parity && !tunnels_.empty()) {
-                // If chosen is same as best, shift by 1
-                int best = select_best_port_index();
-                if (port_index == best) {
-                    port_index = (port_index + 1) % static_cast<int>(tunnels_.size());
-                    // avoid duplicates
-                    while (std::find(used_ports.begin(), used_ports.end(), port_index) != used_ports.end()) {
-                        port_index = (port_index + 1) % static_cast<int>(tunnels_.size());
-                    }
-                }
-            }
-
+    // TRUE PARALLEL DISTRIBUTION - Each port gets different slices for bandwidth multiplication
+    // N ports = N x bandwidth!
+    
+    if (tunnels_.empty() || chunks.empty()) return;
+    
+    // Round-robin distribution across ALL ports for maximum bandwidth
+    size_t port_count = tunnels_.size();
+    
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const auto& slice = chunks[i];
+        
+        if (redundancy == 1) {
+            // No redundancy - pure parallel distribution
+            // Each slice goes to ONE port only = maximum bandwidth
+            int port_index = i % port_count;
             send_slice(slice, port_index);
-            used_ports.push_back(port_index);
+        } else {
+            // With redundancy - send to 'redundancy' number of ports
+            for (int r = 0; r < redundancy && r < port_count; ++r) {
+                int port_index = (i + r) % port_count;
+                send_slice(slice, port_index);
+            }
         }
     }
 }

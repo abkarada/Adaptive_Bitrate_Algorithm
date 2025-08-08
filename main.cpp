@@ -223,12 +223,12 @@ static void print_usage_sender(const char* prog) {
 int main(int argc, char** argv){
     Mat frame;
     VideoCapture cap;
-    int bitrate = 2500000; // Start high bitrate - no more conservative bullshit
+    int bitrate = 5000000; // 5 Mbps constant high bitrate - no changes!
     std::atomic<int> target_bitrate{bitrate};
     int64_t counter = 0;
 
     std::string receiver_ip = "192.168.1.100"; // default target
-    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002}; // Multiple tunnels for redundancy
+    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002, 4003, 4004}; // 5 ports = 5x bandwidth!
 
     // Parse CLI args
     for (int i = 1; i < argc; ++i) {
@@ -280,7 +280,7 @@ int main(int argc, char** argv){
             if(pktv.data.empty()) continue;
             std::vector<std::vector<uint8_t>> one{std::move(pktv.data)};
             udp_sender.send_slices(one);
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            // NO DELAYS - Maximum throughput!
         }
     });
     UDPPortProfiler profiler(receiver_ip, receiver_ports);
@@ -304,17 +304,17 @@ int main(int argc, char** argv){
             int cur = target_bitrate.load();
             int new_bitrate = cur;
 
-            // Reed-Solomon handles packet loss - only reduce bitrate in extreme cases
-            if (avg_loss > 0.80) new_bitrate = std::max(cur * 85 / 100, 2000000);      // Only extreme loss
-            else if (avg_loss < 0.01) new_bitrate = std::min(cur * 102 / 100, 3500000); // Very slow increase
-
-            // No redundancy changes - FEC handles everything
-            // Single port = no cloning needed
-
-            // Only change bitrate if huge difference (>500kbps) - let FEC handle the rest
-            if (abs(new_bitrate - cur) > 500000) {
-                target_bitrate.store(new_bitrate);
-            }
+            // NO BITRATE CHANGES! Keep it constant high
+            // Bitrate stays at 5Mbps no matter what
+            // Use multiple ports to handle network issues, not bitrate reduction
+            
+            // Dynamic redundancy based on loss (more clones for bad network)
+            int new_redundancy = 1;
+            if (avg_loss > 0.10) new_redundancy = 3;      // 10%+ loss = 3 clones
+            else if (avg_loss > 0.05) new_redundancy = 2; // 5%+ loss = 2 clones
+            else new_redundancy = 1;                       // Good network = 1 copy
+            
+            udp_sender.enable_redundancy(new_redundancy);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(3000)); // Update every 3 seconds - very sparse
         }
@@ -408,17 +408,8 @@ int main(int argc, char** argv){
     }
 
     while(cap.read(frame)){
-        // dynamic bitrate adjustment (conservative: keep high floor)
-        if (target_bitrate.load() != current_bitrate) {
-            current_bitrate = target_bitrate.load();
-            ctx->bit_rate = current_bitrate;
-            ctx->rc_buffer_size = current_bitrate * 2;
-            ctx->rc_max_rate = current_bitrate * 2;
-            ctx->rc_min_rate = std::max(current_bitrate / 2, 400000);
-            av_opt_set_int(ctx->priv_data, "b", current_bitrate, 0);
-            av_opt_set_int(ctx->priv_data, "vbv-maxrate", current_bitrate, 0);
-            av_opt_set_int(ctx->priv_data, "vbv-bufsize", current_bitrate, 0);
-        }
+        // NO BITRATE CHANGES - Keep constant 5Mbps
+        // Bitrate adjustment removed for stable quality
         fps_counter++;
         frame_count++;
         std::vector<std::vector<uint8_t>> chunks;
