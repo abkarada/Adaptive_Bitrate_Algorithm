@@ -319,7 +319,7 @@ int main(int argc, char** argv){
     ctx->height = HEIGHT;
     ctx->time_base = AVRational{1, FPS};
     ctx->framerate = AVRational{FPS, 1};
-    ctx->gop_size = 30; // hareketli sahnelerde daha sık IDR için 1 saniyeye yakın
+    ctx->gop_size = 90; // GOP ~3 saniye (30fps)
     ctx->max_b_frames = 0;
     ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP; // bağımsız GOP’lar
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -334,6 +334,11 @@ int main(int argc, char** argv){
     av_opt_set_int(ctx->priv_data, "rc_lookahead", 0, 0);
     av_opt_set(ctx->priv_data, "repeat-headers", "1", 0);
     av_opt_set(ctx->priv_data, "profile", "baseline", 0);
+    // Stabil GOP ve CBR benzeri davranış
+    av_opt_set_int(ctx->priv_data, "keyint", 90, 0);
+    av_opt_set_int(ctx->priv_data, "min-keyint", 90, 0);
+    av_opt_set(ctx->priv_data, "scenecut", "0", 0);
+    av_opt_set(ctx->priv_data, "nal-hrd", "cbr", 0);
 
     int encoder_API = avcodec_open2(ctx, codec, nullptr);
     if (encoder_API < 0)
