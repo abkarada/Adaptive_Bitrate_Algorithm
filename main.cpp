@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -175,7 +176,8 @@ static void print_usage_sender(const char* prog) {
 int main(int argc, char** argv){
     Mat frame;
     VideoCapture cap;
-    int bitrate = 400000;//->Siktiğimin şeyini Adaptive Yapıcam sonra
+    int bitrate = 800000; // initial target bitrate (bps)
+    std::atomic<int> target_bitrate{bitrate};
     int64_t counter = 0;
 
     std::string receiver_ip = "192.168.1.100"; // default target
@@ -214,8 +216,23 @@ int main(int argc, char** argv){
         while (run_profiler.load()) {
             profiler.send_probes();
             profiler.receive_replies_epoll(150);
-            udp_sender.set_profiles(profiler.get_stats());
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            auto stats = profiler.get_stats();
+            udp_sender.set_profiles(stats);
+
+            // simple bitrate adaptation based on average loss
+            double loss_sum = 0.0;
+            for (const auto& s : stats) loss_sum += s.packet_loss;
+            double avg_loss = stats.empty() ? 0.0 : loss_sum / stats.size();
+            int cur = target_bitrate.load();
+            int new_bitrate = cur;
+            if (avg_loss > 0.2) {
+                new_bitrate = std::max(cur * 80 / 100, 300000); // -20 %
+            } else if (avg_loss < 0.02) {
+                new_bitrate = std::min(cur * 110 / 100, 2000000); // +10 %
+            }
+            if (new_bitrate != cur) target_bitrate.store(new_bitrate);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
     });
 
@@ -238,7 +255,8 @@ int main(int argc, char** argv){
         return -1;
     }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
-    ctx->bit_rate = bitrate;
+    int current_bitrate = bitrate;
+    ctx->bit_rate = current_bitrate;
     ctx->width = WIDTH;
     ctx->height = HEIGHT;
     ctx->time_base = AVRational{1, FPS};
@@ -246,9 +264,9 @@ int main(int argc, char** argv){
     ctx->gop_size = 10;
     ctx->max_b_frames = 0;
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    ctx->rc_buffer_size = bitrate;
-    ctx->rc_max_rate    = bitrate;
-    ctx->rc_min_rate    = bitrate;
+    ctx->rc_buffer_size = current_bitrate;
+    ctx->rc_max_rate    = current_bitrate;
+    ctx->rc_min_rate    = current_bitrate;
     ctx->thread_count = 16;
     ctx->thread_type = FF_THREAD_FRAME;
 
@@ -282,6 +300,17 @@ int main(int argc, char** argv){
     auto t0 = chrono::high_resolution_clock::now();
 
     while(cap.read(frame)){
+        // dynamic bitrate adjustment
+        if (target_bitrate.load() != current_bitrate) {
+            current_bitrate = target_bitrate.load();
+            ctx->bit_rate = current_bitrate;
+            ctx->rc_buffer_size = current_bitrate;
+            ctx->rc_max_rate = current_bitrate;
+            ctx->rc_min_rate = current_bitrate;
+            av_opt_set_int(ctx->priv_data, "b", current_bitrate, 0);
+            av_opt_set_int(ctx->priv_data, "vbv-maxrate", current_bitrate, 0);
+            av_opt_set_int(ctx->priv_data, "vbv-bufsize", current_bitrate, 0);
+        }
         fps_counter++;
         frame_count++;
         std::vector<std::vector<uint8_t>> chunks;
@@ -319,9 +348,7 @@ int main(int argc, char** argv){
                 udp_sender.send_slices(built.data_slices);
             }
             if (!built.parity_slices.empty()) {
-                udp_sender.enable_redundancy(1);
                 udp_sender.send_slices(built.parity_slices);
-                udp_sender.enable_redundancy(2);
             }
 
             av_packet_unref(pkt);
