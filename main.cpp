@@ -112,20 +112,18 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         for (const auto& s : g_last_stats) avg_loss += s.packet_loss;
         avg_loss /= g_last_stats.size();
     }
-    // Much more aggressive FEC for real network conditions
-    // Minimum 40% redundancy, up to 80% for high loss
-    double base_redundancy = 0.4; // 40% minimum redundancy
-    double extra_redundancy = avg_loss * 2.0; // 2x of measured loss
-    double fec_ratio = std::min(0.8, base_redundancy + extra_redundancy);
+    // Balanced FEC for real network - not too aggressive
+    // Base 20% redundancy, scale with actual loss
+    double base_redundancy = 0.20; // 20% base redundancy
+    double loss_factor = avg_loss > 0.01 ? avg_loss : 0.01; // min 1% assumed loss
+    double fec_ratio = std::min(0.5, base_redundancy + loss_factor * 1.5);
     r_parity = std::clamp(static_cast<int>(std::ceil(k_data * fec_ratio)), 
-                         std::max(1, k_data * 2 / 5), // min 40% of k
-                         std::max(3, k_data * 4 / 5)); // max 80% of k
+                         2, // min 2 parity blocks
+                         std::max(4, k_data / 2)); // max 50% redundancy
     
-    // Extra redundancy for keyframes - critical for video quality
+    // Moderate extra for keyframes
     if (is_keyframe) {
-        r_parity = std::clamp(static_cast<int>(r_parity * 1.5), 
-                             std::max(2, k_data / 2), // min 50% for keyframes
-                             k_data); // max 100% for keyframes
+        r_parity = std::min(r_parity + 2, k_data * 2 / 3); // max 66% for keyframes
     }
 
     out.k = k_data; out.r = r_parity;
@@ -230,7 +228,7 @@ int main(int argc, char** argv){
     int64_t counter = 0;
 
     std::string receiver_ip = "192.168.1.100"; // default target
-    std::vector<uint16_t> receiver_ports = {4000}; // Single port - no more multiple tunneling bullshit
+    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002}; // Multiple tunnels for redundancy
 
     // Parse CLI args
     for (int i = 1; i < argc; ++i) {
@@ -258,8 +256,8 @@ int main(int argc, char** argv){
     // Global paylaşımlı son profil istatistikleri
     
 
-    // No redundancy needed - Reed-Solomon FEC handles everything
-    udp_sender.enable_redundancy(1);
+    // Clone packets to multiple tunnels for redundancy
+    udp_sender.enable_redundancy(2); // Send each packet through 2 different tunnels
 
     // thread-safe queue for slice buffers
     struct Packet {

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <sstream>
 #include <string>
+#include <set>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -62,6 +63,7 @@ struct FrameBuffer {
     std::vector<uint8_t> data_present;   // k flags
     std::vector<uint8_t> parity_present; // r flags
     std::chrono::steady_clock::time_point first_seen;
+    std::set<std::pair<uint16_t, uint16_t>> received_packets; // track (slice_index, port) to filter duplicates
 };
 
 static inline uint64_t now_us() {
@@ -232,8 +234,8 @@ static void print_usage_receiver(const char* prog) {
 }
 
 int main(int argc, char** argv) {
-    // Single port - no multiple tunneling complexity
-    std::vector<uint16_t> listen_ports = {4000};
+    // Multiple ports for redundancy - smart packet ordering
+    std::vector<uint16_t> listen_ports = {4000, 4001, 4002};
     size_t mtu = 1000; // Fixed size buffer - no fragmentation
 
     // CLI
@@ -298,8 +300,8 @@ int main(int argc, char** argv) {
     SwsContext* sws = nullptr;
 
     std::unordered_map<uint32_t, FrameBuffer> frames;
-    // Very short timeout for maximum FPS - no waiting around
-    std::chrono::milliseconds frame_timeout{20}; // 20ms max wait
+    // Smart 30ms buffering for packet reordering from multiple tunnels
+    std::chrono::milliseconds frame_timeout{30}; // 30ms buffer for reordering
 
     cv::namedWindow("NovaEngine Receiver", cv::WINDOW_AUTOSIZE);
 
@@ -347,20 +349,36 @@ int main(int argc, char** argv) {
                 fb.first_seen = std::chrono::steady_clock::now();
             }
 
+            // Check for duplicate packets from multiple tunnels
+            uint16_t recv_port = ntohs(from.sin_port);
+            auto packet_id = std::make_pair(sh.slice_index, recv_port);
+            
+            // Skip if we already have this slice (from any tunnel)
+            if ((sh.slice_index < fb.k && fb.data_present[sh.slice_index]) ||
+                (sh.slice_index >= fb.k && sh.slice_index - fb.k < fb.r && fb.parity_present[sh.slice_index - fb.k])) {
+                continue; // Already have this slice, skip duplicate
+            }
+            
             const uint8_t* payload = rxbuf.data() + sizeof(SliceHeader);
             if (sh.slice_index < fb.k) {
                 size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
                 std::memcpy(fb.data_blocks[sh.slice_index].data(), payload, copy_len);
                 // checksum validation
                 uint32_t h = 2166136261u; for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.data_blocks[sh.slice_index][i]; h *= 16777619u; }
-                if (h == sh.checksum) fb.data_present[sh.slice_index] = 1;
+                if (h == sh.checksum) {
+                    fb.data_present[sh.slice_index] = 1;
+                    fb.received_packets.insert(packet_id);
+                }
             } else {
                 uint16_t pi = static_cast<uint16_t>(sh.slice_index - fb.k);
                 if (pi < fb.r) {
                     size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
                     std::memcpy(fb.parity_blocks[pi].data(), payload, copy_len);
                     uint32_t h = 2166136261u; for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.parity_blocks[pi][i]; h *= 16777619u; }
-                    if (h == sh.checksum) fb.parity_present[pi] = 1;
+                    if (h == sh.checksum) {
+                        fb.parity_present[pi] = 1;
+                        fb.received_packets.insert(packet_id);
+                    }
                 }
             }
 
