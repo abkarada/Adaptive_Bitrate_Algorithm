@@ -275,6 +275,9 @@ int main(int argc, char** argv){
     // NACK responder thread
     std::atomic<bool> run_nack{true};
     std::thread nack_thread([&]{
+        // pin nack responder thread
+        cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(2, &cp);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(CTRL_NACK_PORT);
         bind(sock, (sockaddr*)&addr, sizeof(addr));
@@ -322,6 +325,9 @@ int main(int argc, char** argv){
     // live profiler thread to feed sender with channel stats
     std::atomic<bool> run_sender{true};
     std::thread sender_thread([&](){
+        // pin sender thread
+        cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(0, &cp);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
         Packet pktv;
         while(true){
             packet_q.pop(pktv);
@@ -335,6 +341,9 @@ int main(int argc, char** argv){
     UDPPortProfiler profiler(receiver_ip, receiver_ports);
     std::atomic<bool> run_profiler{true};
     std::thread profiler_thread([&](){
+        // pin profiler thread
+        cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(1, &cp);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
         while (run_profiler.load()) {
             profiler.send_probes();
             profiler.receive_replies_epoll(150);

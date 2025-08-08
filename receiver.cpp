@@ -10,6 +10,8 @@
 #include <set>
 #include <deque>
 #include <condition_variable>
+#include <pthread.h>
+#include <sched.h>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -329,7 +331,10 @@ int main(int argc, char** argv) {
     std::vector<std::thread> workers;
     workers.reserve(worker_threads);
     for (unsigned t=0; t<worker_threads; ++t) {
-        workers.emplace_back([&]{
+        workers.emplace_back([&, t]{
+            // pin worker to a core
+            cpu_set_t cpuset; CPU_ZERO(&cpuset); CPU_SET((t+1)%std::max(2u, std::thread::hardware_concurrency()), &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
             while (run_workers.load()) {
                 ImgTask task{};
                 {

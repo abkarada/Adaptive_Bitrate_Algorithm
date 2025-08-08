@@ -74,8 +74,10 @@ AdaptiveUDPSender::AdaptiveUDPSender(const std::string& ip, const std::vector<ui
         // Çok büyük gönderim tamponu - packet loss'u önlemek için
         int sndbuf = 16 * 1024 * 1024; // 16MB buffer
         setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-        int tos = 0x10; // IPTOS_LOWDELAY
+        int tos = 0xB8; // DSCP EF (Expedited Forwarding)
         setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+        int prio = 6; // kernel socket priority (0-6 typical)
+        setsockopt(sock, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
 
         tunnels_.emplace_back(sock, port);
     }
