@@ -214,12 +214,12 @@ static void print_usage_sender(const char* prog) {
 int main(int argc, char** argv){
     Mat frame;
     VideoCapture cap;
-    int bitrate = 1500000; // higher initial target bitrate (bps)
+    int bitrate = 2500000; // Start high bitrate - no more conservative bullshit
     std::atomic<int> target_bitrate{bitrate};
     int64_t counter = 0;
 
     std::string receiver_ip = "192.168.1.100"; // default target
-    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002, 4003, 4004};
+    std::vector<uint16_t> receiver_ports = {4000}; // Single port - no more multiple tunneling bullshit
 
     // Parse CLI args
     for (int i = 1; i < argc; ++i) {
@@ -247,8 +247,8 @@ int main(int argc, char** argv){
     // Global paylaşımlı son profil istatistikleri
     
 
-    // default redundancy for data slices
-    udp_sender.enable_redundancy(2);
+    // No redundancy needed - Reed-Solomon FEC handles everything
+    udp_sender.enable_redundancy(1);
 
     // thread-safe queue for slice buffers
     struct Packet {
@@ -295,20 +295,19 @@ int main(int argc, char** argv){
             int cur = target_bitrate.load();
             int new_bitrate = cur;
 
-            // Much less aggressive changes - avoid constant encoder adjustments
-            if (avg_loss > 0.50) new_bitrate = std::max(cur * 90 / 100, 1500000);      // Only severe loss
-            else if (avg_loss < 0.02) new_bitrate = std::min(cur * 105 / 100, 2500000); // Only very low loss
+            // Reed-Solomon handles packet loss - only reduce bitrate in extreme cases
+            if (avg_loss > 0.80) new_bitrate = std::max(cur * 85 / 100, 2000000);      // Only extreme loss
+            else if (avg_loss < 0.01) new_bitrate = std::min(cur * 102 / 100, 3500000); // Very slow increase
 
-            // Tek kanalda clone = 1; çok kanalda kayba göre 1..3
-            int new_redundancy = (receiver_ports.size() > 1) ? (avg_loss > 0.10 ? 3 : (avg_loss > 0.03 ? 2 : 1)) : 1;
-            udp_sender.enable_redundancy(new_redundancy);
+            // No redundancy changes - FEC handles everything
+            // Single port = no cloning needed
 
-            // Only change bitrate if significant difference (>200kbps)
-            if (abs(new_bitrate - cur) > 200000) {
+            // Only change bitrate if huge difference (>500kbps) - let FEC handle the rest
+            if (abs(new_bitrate - cur) > 500000) {
                 target_bitrate.store(new_bitrate);
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Update every 1 second instead of 300ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(3000)); // Update every 3 seconds - very sparse
         }
     });
 

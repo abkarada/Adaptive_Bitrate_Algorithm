@@ -232,8 +232,8 @@ static void print_usage_receiver(const char* prog) {
 }
 
 int main(int argc, char** argv) {
-    // Defaults
-    std::vector<uint16_t> listen_ports = {4000, 4001, 4002, 4003, 4004};
+    // Single port - no multiple tunneling complexity
+    std::vector<uint16_t> listen_ports = {4000};
     size_t mtu = 1200;
 
     // CLI
