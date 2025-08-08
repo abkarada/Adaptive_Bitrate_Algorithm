@@ -255,6 +255,12 @@ int main(int argc, char** argv){
             } else if (avg_loss < 0.02) {
                 new_bitrate = std::min(cur * 110 / 100, 2000000); // +10 %
             }
+            // choose redundancy based on loss
+            int new_redundancy = 1;
+            if (avg_loss > 0.05) new_redundancy = 2;
+            if (avg_loss > 0.15) new_redundancy = 3;
+            udp_sender.enable_redundancy(new_redundancy);
+
             if (new_bitrate != cur) target_bitrate.store(new_bitrate);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
