@@ -71,8 +71,8 @@ AdaptiveUDPSender::AdaptiveUDPSender(const std::string& ip, const std::vector<ui
             continue;
         }
 
-        // Büyük gönderim tamponu ve düşük gecikme önceliği
-        int sndbuf = 8 * 1024 * 1024; // 8MB
+        // Çok büyük gönderim tamponu - packet loss'u önlemek için
+        int sndbuf = 16 * 1024 * 1024; // 16MB buffer
         setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
         int tos = 0x10; // IPTOS_LOWDELAY
         setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));

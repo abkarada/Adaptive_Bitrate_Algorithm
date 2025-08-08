@@ -234,7 +234,7 @@ static void print_usage_receiver(const char* prog) {
 int main(int argc, char** argv) {
     // Single port - no multiple tunneling complexity
     std::vector<uint16_t> listen_ports = {4000};
-    size_t mtu = 1200;
+    size_t mtu = 1000; // Fixed size buffer - no fragmentation
 
     // CLI
     for (int i = 1; i < argc; ++i) {
@@ -267,6 +267,11 @@ int main(int argc, char** argv) {
     for (uint16_t port : listen_ports) {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) { perror("socket"); continue; }
+        
+        // Huge receive buffer to prevent packet loss
+        int rcvbuf = 16 * 1024 * 1024; // 16MB receive buffer
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        
         sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
         if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(fd); continue; }
         sockets.push_back(fd);
@@ -298,7 +303,7 @@ int main(int argc, char** argv) {
 
     cv::namedWindow("NovaEngine Receiver", cv::WINDOW_AUTOSIZE);
 
-    size_t rxbuf_capacity = std::max<size_t>(mtu, 2048);
+    size_t rxbuf_capacity = std::max<size_t>(mtu, 4096); // Bigger receive buffer
     std::vector<uint8_t> rxbuf(rxbuf_capacity);
     epoll_event events[32];
 

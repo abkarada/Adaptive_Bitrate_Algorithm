@@ -41,7 +41,7 @@ extern "C" {
 
 // k ve r dinamik hesaplanacak, burada sabitler kullanılmıyor
 
-static size_t mtu = 800; // Smaller MTU for better network reliability
+static size_t mtu = 1000; // Fixed size buffer - no fragmentation issues
 
 using namespace cv;
 using namespace std;
