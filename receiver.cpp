@@ -300,8 +300,10 @@ int main(int argc, char** argv) {
     SwsContext* sws = nullptr;
 
     std::unordered_map<uint32_t, FrameBuffer> frames;
-    // Smart 30ms buffering for packet reordering from multiple tunnels
-    std::chrono::milliseconds frame_timeout{30}; // 30ms buffer for reordering
+    // Smart buffer window depends on number of ports: more ports -> slightly larger window
+    int num_ports = static_cast<int>(listen_ports.size());
+    int buffer_ms = (num_ports <= 1) ? 20 : (num_ports <= 3 ? 35 : 45);
+    std::chrono::milliseconds frame_timeout{buffer_ms};
 
     cv::namedWindow("NovaEngine Receiver", cv::WINDOW_AUTOSIZE);
 
@@ -310,8 +312,8 @@ int main(int argc, char** argv) {
     epoll_event events[32];
 
     while (true) {
-        // No dynamic timeout calculations - just process packets as fast as possible
-        int nfds = epoll_wait(epfd, events, 32, 5); // Reduced from 50ms to 5ms for responsiveness
+        // epoll poll time aligned with buffer
+        int nfds = epoll_wait(epfd, events, 32, std::max(5, buffer_ms / 3));
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
             sockaddr_in from{}; socklen_t fromlen = sizeof(from);

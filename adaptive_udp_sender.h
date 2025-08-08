@@ -174,28 +174,67 @@ int AdaptiveUDPSender::select_weighted_port_index(const std::vector<int>& exclud
 }
 
 void AdaptiveUDPSender::send_slices(const std::vector<std::vector<uint8_t>>& chunks) {
-    // TRUE PARALLEL DISTRIBUTION - Each port gets different slices for bandwidth multiplication
-    // N ports = N x bandwidth!
-    
+    // Weighted best-port strategy:
+    // - Data slices: prefer the best tunnel(s)
+    // - Parity slices: diversify onto different tunnels to maximize independence
+    // - Redundancy > 1: send clones to next-best distinct tunnels
+    struct SliceHeaderLocal {
+        uint32_t magic;
+        uint32_t frame_id;
+        uint16_t slice_index;
+        uint16_t total_slices;
+        uint16_t k_data;
+        uint16_t r_parity;
+        uint16_t payload_bytes;
+        uint32_t total_frame_bytes;
+        uint64_t timestamp_us;
+        uint8_t  flags;
+        uint32_t checksum;
+    };
+
     if (tunnels_.empty() || chunks.empty()) return;
-    
-    // Round-robin distribution across ALL ports for maximum bandwidth
-    size_t port_count = tunnels_.size();
-    
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        const auto& slice = chunks[i];
-        
-        if (redundancy == 1) {
-            // No redundancy - pure parallel distribution
-            // Each slice goes to ONE port only = maximum bandwidth
-            int port_index = i % port_count;
-            send_slice(slice, port_index);
-        } else {
-            // With redundancy - send to 'redundancy' number of ports
-            for (int r = 0; r < redundancy && r < port_count; ++r) {
-                int port_index = (i + r) % port_count;
-                send_slice(slice, port_index);
+
+    for (const auto& slice : chunks) {
+        bool is_parity = false;
+        if (slice.size() >= sizeof(SliceHeaderLocal)) {
+            SliceHeaderLocal hdr{};
+            std::memcpy(&hdr, slice.data(), sizeof(SliceHeaderLocal));
+            is_parity = (hdr.flags & 0x01) != 0;
+        }
+
+        std::vector<int> used_ports;
+        int clones = std::min<int>(redundancy, static_cast<int>(tunnels_.size()));
+
+        for (int c = 0; c < clones; ++c) {
+            int port_index = -1;
+            if (!is_parity) {
+                // Data: prefer best tunnel first, then next-best excluding already used
+                if (c == 0) {
+                    port_index = select_best_port_index();
+                    // avoid duplicates
+                    if (std::find(used_ports.begin(), used_ports.end(), port_index) != used_ports.end()) {
+                        port_index = select_weighted_port_index(used_ports, /*favor_diversity*/ true);
+                    }
+                } else {
+                    port_index = select_weighted_port_index(used_ports, /*favor_diversity*/ false);
+                }
+            } else {
+                // Parity: diversify away from the very best path
+                int best = select_best_port_index();
+                port_index = select_weighted_port_index(used_ports, /*favor_diversity*/ true);
+                if (port_index == best) {
+                    // shift to a different tunnel to keep independence
+                    port_index = (port_index + 1) % static_cast<int>(tunnels_.size());
+                    // avoid duplicates
+                    while (std::find(used_ports.begin(), used_ports.end(), port_index) != used_ports.end()) {
+                        port_index = (port_index + 1) % static_cast<int>(tunnels_.size());
+                    }
+                }
             }
+
+            if (port_index < 0) port_index = select_best_port_index();
+            send_slice(slice, port_index);
+            used_ports.push_back(port_index);
         }
     }
 }
