@@ -5,6 +5,8 @@
 #include <iostream>
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
+#include <cstdlib>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -39,6 +41,7 @@ private:
 
     int select_best_port_index();
     void send_slice(const std::vector<uint8_t>& slice, int tunnel_index);
+    int select_weighted_port_index(const std::vector<int>& exclude_indices, bool favor_diversity);
 };
 
 AdaptiveUDPSender::AdaptiveUDPSender(const std::string& ip, const std::vector<uint16_t>& remote_ports)
@@ -107,16 +110,93 @@ double score = stat.avg_rtt_ms + 1000.0 * stat.packet_loss;
     return best_index;
 }
 
+int AdaptiveUDPSender::select_weighted_port_index(const std::vector<int>& exclude_indices, bool favor_diversity) {
+    if (tunnels_.empty()) return -1;
+
+    // Compute weights inversely proportional to (loss, rtt)
+    // weight = 1 / (epsilon + alpha*loss + beta*rtt_ms)
+    constexpr double epsilon = 1e-3;
+    constexpr double alpha = 2.0;   // loss emphasis
+    constexpr double beta = 0.01;   // RTT emphasis
+
+    std::vector<double> weights(tunnels_.size(), 0.0);
+    double sum_w = 0.0;
+    for (size_t i = 0; i < tunnels_.size(); ++i) {
+        if (std::find(exclude_indices.begin(), exclude_indices.end(), static_cast<int>(i)) != exclude_indices.end()) continue;
+        const auto& s = tunnels_[i].stat;
+        double denom = epsilon + alpha * s.packet_loss + beta * std::max(0.0, s.avg_rtt_ms);
+        double w = (denom > 0.0) ? (1.0 / denom) : 0.0;
+        weights[i] = w;
+        sum_w += w;
+    }
+
+    if (sum_w <= 0.0) {
+        // fallback: round-robin avoiding excludes
+        for (size_t i = 0; i < tunnels_.size(); ++i) {
+            if (std::find(exclude_indices.begin(), exclude_indices.end(), static_cast<int>(i)) == exclude_indices.end()) {
+                return static_cast<int>(i);
+            }
+        }
+        return 0;
+    }
+
+    // Favor diversity: slightly boost least-used index using simple rr pointer
+    // We will start sampling from rr_index_ to promote spread
+    size_t start = rr_index_ % tunnels_.size();
+    double pick = ((double)rand() / (double)RAND_MAX) * sum_w;
+    double acc = 0.0;
+    for (size_t of = 0; of < tunnels_.size(); ++of) {
+        size_t i = (start + of) % tunnels_.size();
+        if (std::find(exclude_indices.begin(), exclude_indices.end(), static_cast<int>(i)) != exclude_indices.end()) continue;
+        acc += weights[i];
+        if (pick <= acc) {
+            rr_index_ = (i + 1) % tunnels_.size();
+            return static_cast<int>(i);
+        }
+    }
+    return select_best_port_index();
+}
+
 void AdaptiveUDPSender::send_slices(const std::vector<std::vector<uint8_t>>& chunks) {
+    // We will parse SliceHeader flags to diversify data vs parity placement
+    struct SliceHeaderLocal {
+        uint32_t magic;
+        uint32_t frame_id;
+        uint16_t slice_index;
+        uint16_t total_slices;
+        uint16_t k_data;
+        uint16_t r_parity;
+        uint32_t total_frame_bytes;
+        uint64_t timestamp_us;
+        uint8_t  flags;
+    };
+
     for (const auto& slice : chunks) {
+        bool is_parity = false;
+        if (slice.size() >= sizeof(SliceHeaderLocal)) {
+            SliceHeaderLocal hdr{};
+            std::memcpy(&hdr, slice.data(), sizeof(SliceHeaderLocal));
+            is_parity = (hdr.flags & 0x01) != 0;
+        }
+
         std::vector<int> used_ports;
+        int clones = std::min<int>(redundancy, static_cast<int>(tunnels_.size()));
+        for (int i = 0; i < clones; ++i) {
+            int port_index = select_weighted_port_index(used_ports, /*favor_diversity*/ true);
+            if (port_index < 0) port_index = select_best_port_index();
 
-        for (int i = 0; i < redundancy; ++i) {
-            int port_index = select_best_port_index();
-
-            // Aynı portu iki kez seçmemeye çalış (varsayım: redundancy < tunnel sayısı)
-            while (std::find(used_ports.begin(), used_ports.end(), port_index) != used_ports.end()) {
-                port_index = (port_index + 1) % tunnels_.size();  // round-robin fallback
+            // Ensure data/parity are diversified across different paths
+            // If parity, try to avoid the absolute best port to keep independence
+            if (is_parity && !tunnels_.empty()) {
+                // If chosen is same as best, shift by 1
+                int best = select_best_port_index();
+                if (port_index == best) {
+                    port_index = (port_index + 1) % static_cast<int>(tunnels_.size());
+                    // avoid duplicates
+                    while (std::find(used_ports.begin(), used_ports.end(), port_index) != used_ports.end()) {
+                        port_index = (port_index + 1) % static_cast<int>(tunnels_.size());
+                    }
+                }
             }
 
             send_slice(slice, port_index);

@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <sstream>
 #include <string>
+#include <cmath>
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
@@ -37,13 +38,15 @@ extern "C" {
 #define FPS 30
 
 
-const int k = 20;
-const int r = 5;
+// k ve r dinamik hesaplanacak, burada sabitler kullanılmıyor
 
 static size_t mtu = 1200;
 
 using namespace cv;
 using namespace std;
+
+// Son profil istatistiklerini FEC r hesaplamasında kullanmak için global buffer
+std::vector<UDPChannelStat> g_last_stats;
 
 // === Transmission slice header and FEC builder ===
 #pragma pack(push, 1)
@@ -97,7 +100,20 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
     const size_t payload_size = mtu_bytes - header_size;
     int k_data = static_cast<int>((size + payload_size - 1) / payload_size);
     if (k_data <= 0) k_data = 1;
-    int r_parity = std::clamp(k_data / 4, 1, 10);
+
+    // Dinamik r belirleme: son profil metriklerine göre
+    int r_parity = 1;
+    extern std::vector<UDPChannelStat> g_last_stats; // aşağıda güncellenecek
+    double avg_loss = 0.0;
+    if (!g_last_stats.empty()) {
+        for (const auto& s : g_last_stats) avg_loss += s.packet_loss;
+        avg_loss /= g_last_stats.size();
+    }
+    // Temel kural: hedef kurtarma oranı ~ avg_loss marjlı
+    // r ≈ ceil(k * min(0.5, avg_loss * 1.5) ) sınırlarıyla
+    double fec_ratio = std::min(0.5, avg_loss * 1.5 + 0.01); // + küçük güvenlik payı
+    r_parity = std::clamp(static_cast<int>(std::ceil(k_data * fec_ratio)), 1, std::max(2, k_data));
+
     out.k = k_data; out.r = r_parity;
 
     out.data_slices.resize(k_data);
@@ -132,7 +148,7 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         for (int i = 0; i < r_parity; ++i) parity_ptrs[i] = parity_payloads[i].data();
 
         std::vector<uint8_t> matrix(static_cast<size_t>(k_data + r_parity) * static_cast<size_t>(k_data));
-        std::vector<uint8_t> g_tbls(32 * 1024);
+        std::vector<uint8_t> g_tbls(static_cast<size_t>(k_data) * static_cast<size_t>(r_parity) * 32);
         gf_gen_rs_matrix(matrix.data(), k_data + r_parity, k_data);
         ec_init_tables(k_data, r_parity, matrix.data() + k_data * k_data, g_tbls.data());
         ec_encode_data(static_cast<int>(payload_size), k_data, r_parity, g_tbls.data(), data_ptrs.data(), parity_ptrs.data());
@@ -207,6 +223,9 @@ int main(int argc, char** argv){
     }
 
     AdaptiveUDPSender udp_sender(receiver_ip, receiver_ports);
+    
+    // Global paylaşımlı son profil istatistikleri
+    
 
     // default redundancy for data slices
     udp_sender.enable_redundancy(2);
@@ -243,6 +262,8 @@ int main(int argc, char** argv){
             profiler.receive_replies_epoll(150);
             auto stats = profiler.get_stats();
             udp_sender.set_profiles(stats);
+            // Global istatistikleri güncelle
+            g_last_stats = stats;
 
             // simple bitrate adaptation based on average loss
             double loss_sum = 0.0;
