@@ -321,6 +321,7 @@ int main(int argc, char** argv){
     ctx->framerate = AVRational{FPS, 1};
     ctx->gop_size = 30; // hareketli sahnelerde daha sık IDR için 1 saniyeye yakın
     ctx->max_b_frames = 0;
+    ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP; // bağımsız GOP’lar
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->rc_buffer_size = current_bitrate * 2;
     ctx->rc_max_rate    = current_bitrate * 2;
