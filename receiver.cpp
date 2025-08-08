@@ -30,8 +30,8 @@ extern "C" {
 
 using namespace std;
 
-// Global stats from profiler (shared with sender)
-extern std::vector<UDPChannelStat> g_last_stats;
+// Simplified receiver - no shared stats needed
+// std::vector<UDPChannelStat> g_last_stats; // Removed for performance
 
 // Mirror of sender's header
 #pragma pack(push, 1)
@@ -293,8 +293,8 @@ int main(int argc, char** argv) {
     SwsContext* sws = nullptr;
 
     std::unordered_map<uint32_t, FrameBuffer> frames;
-    // Dynamic timeout based on network conditions - will be updated from profiler stats
-    std::chrono::milliseconds frame_timeout{100}; // Default fallback
+    // Very short timeout for maximum FPS - no waiting around
+    std::chrono::milliseconds frame_timeout{20}; // 20ms max wait
 
     cv::namedWindow("NovaEngine Receiver", cv::WINDOW_AUTOSIZE);
 
@@ -303,18 +303,8 @@ int main(int argc, char** argv) {
     epoll_event events[32];
 
     while (true) {
-        // Update dynamic timeout based on worst RTT + safety margin
-        if (!g_last_stats.empty()) {
-            double max_rtt = 0.0;
-            for (const auto& stat : g_last_stats) {
-                max_rtt = std::max(max_rtt, stat.avg_rtt_ms);
-            }
-            // Timeout = max_RTT + 50% safety margin, min 50ms, max 300ms
-            int dynamic_timeout = std::max(50.0, std::min(300.0, max_rtt * 1.5));
-            frame_timeout = std::chrono::milliseconds(dynamic_timeout);
-        }
-        
-        int nfds = epoll_wait(epfd, events, 32, 50);
+        // No dynamic timeout calculations - just process packets as fast as possible
+        int nfds = epoll_wait(epfd, events, 32, 5); // Reduced from 50ms to 5ms for responsiveness
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
             sockaddr_in from{}; socklen_t fromlen = sizeof(from);
@@ -391,20 +381,9 @@ int main(int argc, char** argv) {
                         int dstStride[] = { static_cast<int>(img.step[0]), 0, 0, 0 };
                         sws_scale(sws, frm->data, frm->linesize, 0, frm->height, dst, dstStride);
                         
-                        // Frame timing control - 30 FPS target
-                        static uint64_t last_display_time = 0;
-                        uint64_t target_frame_interval = 33333; // 33.33ms for 30 FPS (microseconds)
-                        uint64_t current_time = now_us();
-                        
-                        if (current_time - last_display_time >= target_frame_interval) {
-                            cv::imshow("NovaEngine Receiver", img);
-                            last_display_time = current_time;
-                            cv::waitKey(1);
-                        } else {
-                            // Skip frame to maintain timing
-                            std::this_thread::sleep_for(std::chrono::microseconds(
-                                target_frame_interval - (current_time - last_display_time)));
-                        }
+                        // No FPS limiting - display immediately for minimum latency
+                        cv::imshow("NovaEngine Receiver", img);
+                        cv::waitKey(1); // Minimal wait for OpenCV event processing
                     }
                 }
                 frames.erase(sh.frame_id);

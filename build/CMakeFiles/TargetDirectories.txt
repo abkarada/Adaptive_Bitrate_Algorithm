@@ -1,0 +1,4 @@
+/home/ryuzaki/Desktop/untitled/build/CMakeFiles/camera_ffmpeg.dir
+/home/ryuzaki/Desktop/untitled/build/CMakeFiles/nova_receiver.dir
+/home/ryuzaki/Desktop/untitled/build/CMakeFiles/edit_cache.dir
+/home/ryuzaki/Desktop/untitled/build/CMakeFiles/rebuild_cache.dir
