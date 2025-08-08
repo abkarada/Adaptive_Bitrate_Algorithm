@@ -198,7 +198,7 @@ static void print_usage_sender(const char* prog) {
 int main(int argc, char** argv){
     Mat frame;
     VideoCapture cap;
-    int bitrate = 1200000; // higher initial target bitrate (bps)
+    int bitrate = 1500000; // higher initial target bitrate (bps)
     std::atomic<int> target_bitrate{bitrate};
     int64_t counter = 0;
 
@@ -279,13 +279,13 @@ int main(int argc, char** argv){
             int cur = target_bitrate.load();
             int new_bitrate = cur;
 
-            // Loss odaklı AMA alt limite sabitleyen kontrol: yüksek kaliteyi koru
-            if (avg_loss > 0.20) new_bitrate = std::max(cur * 85 / 100, 800000); // -15% ama 800kbps altına düşme
-            else if (avg_loss > 0.10) new_bitrate = std::max(cur * 90 / 100, 900000);
-            else if (avg_loss < 0.03 && avg_rtt < 60) new_bitrate = std::min(cur * 112 / 100, 2500000);
+            // Lokal ağda hedef: sabit yüksek. Sadece aşırı kayıpta az indir, hızlı geri dön
+            if (avg_loss > 0.30) new_bitrate = std::max(cur * 85 / 100, 1200000);
+            else if (avg_loss > 0.15) new_bitrate = std::max(cur * 92 / 100, 1300000);
+            else if (avg_loss < 0.05) new_bitrate = std::min(cur * 110 / 100, 3000000);
 
             // Tek kanalda clone = 1; çok kanalda kayba göre 1..3
-            int new_redundancy = (receiver_ports.size() > 1) ? (avg_loss > 0.15 ? 3 : (avg_loss > 0.05 ? 2 : 1)) : 1;
+            int new_redundancy = (receiver_ports.size() > 1) ? (avg_loss > 0.10 ? 3 : (avg_loss > 0.03 ? 2 : 1)) : 1;
             udp_sender.enable_redundancy(new_redundancy);
 
             if (new_bitrate != cur) target_bitrate.store(new_bitrate);
@@ -325,7 +325,7 @@ int main(int argc, char** argv){
     ctx->rc_buffer_size = current_bitrate * 2;
     ctx->rc_max_rate    = current_bitrate * 2;
     ctx->rc_min_rate    = std::max(current_bitrate / 2, 400000);
-    ctx->thread_count = 16;
+    ctx->thread_count = 4; // CPU baskısını azaltarak sabit performans
     ctx->thread_type = FF_THREAD_FRAME;
 
     av_opt_set(ctx->priv_data, "preset", "veryfast", 0);

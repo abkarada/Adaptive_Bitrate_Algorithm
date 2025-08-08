@@ -268,6 +268,7 @@ int main(int argc, char** argv) {
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) { std::cerr << "H264 decoder not found" << std::endl; return 2; }
     AVCodecContext* dctx = avcodec_alloc_context3(codec);
+    // keep default decoder opts; no libavutil/opt on receiver to minimize deps
     if (avcodec_open2(dctx, codec, nullptr) < 0) { std::cerr << "decoder open failed" << std::endl; return 2; }
     AVFrame* frm = av_frame_alloc();
     AVPacket* pkt = av_packet_alloc();

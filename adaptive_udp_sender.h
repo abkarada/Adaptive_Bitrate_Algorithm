@@ -66,6 +66,12 @@ AdaptiveUDPSender::AdaptiveUDPSender(const std::string& ip, const std::vector<ui
             continue;
         }
 
+        // Büyük gönderim tamponu ve düşük gecikme önceliği
+        int sndbuf = 8 * 1024 * 1024; // 8MB
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        int tos = 0x10; // IPTOS_LOWDELAY
+        setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+
         tunnels_.emplace_back(sock, port);
     }
 }
@@ -89,8 +95,13 @@ void AdaptiveUDPSender::send_slice(const std::vector<uint8_t>& slice, int tunnel
     dest.sin_port = htons(tunnels_[tunnel_index].remote_port);
     inet_pton(AF_INET, remote_ip_.c_str(), &dest.sin_addr);
 
-    sendto(tunnels_[tunnel_index].socket_fd, slice.data(), slice.size(), 0,
-           reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+    // Retry kısa beklemelerle: ENOBUFS/EAGAIN durumunda düşürmeyelim
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ssize_t sent = sendto(tunnels_[tunnel_index].socket_fd, slice.data(), slice.size(), 0,
+                              reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+        if (sent == static_cast<ssize_t>(slice.size())) return;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
 }
 
 int AdaptiveUDPSender::select_best_port_index() {
