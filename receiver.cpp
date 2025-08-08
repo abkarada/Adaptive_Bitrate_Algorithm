@@ -39,6 +39,7 @@ struct SliceHeader {
     uint16_t total_slices;     // k + r
     uint16_t k_data;           // k
     uint16_t r_parity;         // r
+    uint16_t payload_bytes;    // payload size used by encoder
     uint32_t total_frame_bytes;// original encoded size
     uint64_t timestamp_us;     // sender ts
     uint8_t  flags;            // bit0 parity
@@ -137,47 +138,34 @@ static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_byt
     std::vector<uint8_t> a(static_cast<size_t>(m) * static_cast<size_t>(k));
     gf_gen_rs_matrix(a.data(), m, k);
 
-    // Build error list (indices of missing fragments among first k)
+    // Build error list for missing data fragments only (indices among 0..k-1)
     std::vector<uint8_t> frag_err_list;
-    frag_err_list.reserve(m);
+    frag_err_list.reserve(k);
     for (int i = 0; i < k; ++i) if (!fb.data_present[i]) frag_err_list.push_back(static_cast<uint8_t>(i));
     int nerrs = static_cast<int>(frag_err_list.size());
+    if (nerrs == 0) return false; // shouldn't reach here, fast path handled earlier
 
-    // Choose k surviving fragment indices for building B and recover_srcs
-    std::vector<uint8_t> survive_indices;
-    survive_indices.reserve(k);
-    for (int i = 0; i < k && (int)survive_indices.size() < k; ++i) if (fb.data_present[i]) survive_indices.push_back(static_cast<uint8_t>(i));
-    for (int i = 0; i < r && (int)survive_indices.size() < k; ++i) if (fb.parity_present[i]) survive_indices.push_back(static_cast<uint8_t>(k + i));
-    if ((int)survive_indices.size() < k) return false;
-
-    // Construct temp_matrix from survive_indices rows
-    std::vector<uint8_t> temp_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
-    for (int row = 0; row < k; ++row) {
-        uint8_t idx = survive_indices[row];
-        for (int col = 0; col < k; ++col) temp_matrix[k * row + col] = a[k * idx + col];
-    }
-    std::vector<uint8_t> invert_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
-    if (gf_invert_matrix(temp_matrix.data(), invert_matrix.data(), k) < 0) return false;
-
-    // Build decode_matrix for missing data blocks
     std::vector<uint8_t> decode_matrix(static_cast<size_t>(k) * static_cast<size_t>(nerrs));
-    for (int e = 0; e < nerrs; ++e) {
-        int err_idx = frag_err_list[e];
-        // Row for source erasure err_idx is inverse row err_idx
-        for (int j = 0; j < k; ++j) decode_matrix[k * e + j] = invert_matrix[k * err_idx + j];
+    std::vector<uint8_t> invert_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
+    std::vector<uint8_t> temp_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
+    std::vector<uint8_t> decode_index(static_cast<size_t>(k));
+
+    if (gen_decode_matrix_rs(a.data(), decode_matrix.data(), invert_matrix.data(), temp_matrix.data(),
+                             decode_index.data(), frag_err_list.data(), nerrs, k, m) < 0) {
+        return false;
     }
 
-    // Prepare recover_srcs pointers (k surviving frags payloads)
+    // Prepare recover_srcs pointers using decode_index mapping
     std::vector<uint8_t*> recover_srcs(static_cast<size_t>(k), nullptr);
-    for (int row = 0; row < k; ++row) {
-        uint8_t idx = survive_indices[row];
-        if (idx < k) recover_srcs[row] = fb.data_blocks[idx].data();
-        else recover_srcs[row] = fb.parity_blocks[idx - k].data();
+    for (int i = 0; i < k; ++i) {
+        uint8_t idx = decode_index[static_cast<size_t>(i)];
+        if (idx < k) recover_srcs[static_cast<size_t>(i)] = fb.data_blocks[idx].data();
+        else recover_srcs[static_cast<size_t>(i)] = fb.parity_blocks[idx - k].data();
     }
     // Output buffers for recovered data blocks
     std::vector<std::vector<uint8_t>> recover_out(static_cast<size_t>(nerrs), std::vector<uint8_t>(len));
     std::vector<uint8_t*> recover_outp(static_cast<size_t>(nerrs));
-    for (int i = 0; i < nerrs; ++i) recover_outp[i] = recover_out[i].data();
+    for (int i = 0; i < nerrs; ++i) recover_outp[static_cast<size_t>(i)] = recover_out[static_cast<size_t>(i)].data();
 
     // Initialize g_tbls and recover
     std::vector<uint8_t> g_tbls(static_cast<size_t>(k) * static_cast<size_t>(nerrs) * 32);
@@ -186,9 +174,9 @@ static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_byt
 
     // Place recovered data blocks back to their indices
     for (int i = 0; i < nerrs; ++i) {
-        int idx = frag_err_list[i];
-        fb.data_blocks[idx] = std::move(recover_out[i]);
-        fb.data_present[idx] = 1;
+        int idx = frag_err_list[static_cast<size_t>(i)];
+        fb.data_blocks[static_cast<size_t>(idx)] = std::move(recover_out[static_cast<size_t>(i)]);
+        fb.data_present[static_cast<size_t>(idx)] = 1;
     }
 
     // Now we should have all k data blocks
@@ -314,7 +302,8 @@ int main(int argc, char** argv) {
             if (fb.k == 0) {
                 fb.frame_id = sh.frame_id;
                 fb.k = sh.k_data; fb.r = sh.r_parity; fb.m = sh.total_slices;
-                fb.payload_size = static_cast<uint16_t>(payload_size);
+                // Trust sender-advertised payload_bytes to avoid MTU mismatch
+                fb.payload_size = sh.payload_bytes ? sh.payload_bytes : static_cast<uint16_t>(payload_size);
                 fb.total_frame_bytes = sh.total_frame_bytes;
                 fb.data_blocks.assign(fb.k, std::vector<uint8_t>(payload_size));
                 fb.parity_blocks.assign(fb.r, std::vector<uint8_t>(payload_size));
@@ -335,19 +324,24 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Try reconstruct
+             // Try reconstruct
             std::vector<uint8_t> complete;
             if (try_reconstruct_frame(fb, complete)) {
-                // Decode with FFmpeg
+                // Decode with FFmpeg using owned buffer (avoids lifetime issues)
                 av_packet_unref(pkt);
-                pkt->data = complete.data();
-                pkt->size = static_cast<int>(complete.size());
-                if (avcodec_send_packet(dctx, pkt) == 0) {
+                if (av_new_packet(pkt, static_cast<int>(complete.size())) == 0) {
+                    std::memcpy(pkt->data, complete.data(), complete.size());
+                } else {
+                    continue;
+                }
+                 if (avcodec_send_packet(dctx, pkt) == 0) {
                     while (avcodec_receive_frame(dctx, frm) == 0) {
+                         // Drop non-keyframe decode after large conceal if keyframe flag missing
                         // Allocate sws on demand
                         if (!sws) sws = sws_getContext(frm->width, frm->height, (AVPixelFormat)frm->format,
                                                        frm->width, frm->height, AV_PIX_FMT_BGR24,
                                                        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                        if (!sws) break;
                         cv::Mat img(frm->height, frm->width, CV_8UC3);
                         uint8_t* dst[] = { img.data, nullptr, nullptr, nullptr };
                         int dstStride[] = { static_cast<int>(img.step[0]), 0, 0, 0 };

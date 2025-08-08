@@ -57,6 +57,7 @@ struct SliceHeader {
     uint16_t total_slices = 0; // k + r
     uint16_t k_data = 0;
     uint16_t r_parity = 0;
+    uint16_t payload_bytes = 0; // payload size used for RS
     uint32_t total_frame_bytes = 0; // encoded size of this block
     uint64_t timestamp_us = 0;
     uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe
@@ -92,7 +93,7 @@ static inline uint64_t now_us() {
         .count();
 }
 
-BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_bytes, uint32_t frame_id) {
+BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_bytes, uint32_t frame_id, bool is_keyframe) {
     BuiltSlices out{};
     const size_t header_size = sizeof(SliceHeader);
     if (mtu_bytes <= header_size) return out;
@@ -126,9 +127,10 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
         hdr.k_data = static_cast<uint16_t>(k_data);
         hdr.r_parity = static_cast<uint16_t>(r_parity);
+        hdr.payload_bytes = static_cast<uint16_t>(payload_size);
         hdr.total_frame_bytes = static_cast<uint32_t>(size);
         hdr.timestamp_us = now_us();
-        hdr.flags = 0;
+        hdr.flags = is_keyframe ? 0x02 : 0x00; // bit1: keyframe
         std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
 
         size_t remain = (src_off < size) ? (size - src_off) : 0;
@@ -162,9 +164,10 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
             hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
             hdr.k_data = static_cast<uint16_t>(k_data);
             hdr.r_parity = static_cast<uint16_t>(r_parity);
+            hdr.payload_bytes = static_cast<uint16_t>(payload_size);
             hdr.total_frame_bytes = static_cast<uint32_t>(size);
             hdr.timestamp_us = now_us();
-            hdr.flags = 0x01; // parity
+            hdr.flags = static_cast<uint8_t>(0x01 | (is_keyframe ? 0x02 : 0x00)); // parity + keyframe
             std::memcpy(out.parity_slices[i].data(), &hdr, sizeof(SliceHeader));
             std::memcpy(out.parity_slices[i].data() + header_size, parity_payloads[i].data(), payload_size);
         }
@@ -313,7 +316,7 @@ int main(int argc, char** argv){
     ctx->height = HEIGHT;
     ctx->time_base = AVRational{1, FPS};
     ctx->framerate = AVRational{FPS, 1};
-    ctx->gop_size = 10;
+    ctx->gop_size = 20; // daha uzun GOP ile I-frame aralığı net
     ctx->max_b_frames = 0;
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->rc_buffer_size = current_bitrate;
@@ -325,6 +328,8 @@ int main(int argc, char** argv){
     av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
     av_opt_set(ctx->priv_data, "tune",   "zerolatency", 0);
     av_opt_set_int(ctx->priv_data, "rc_lookahead", 0, 0);
+    av_opt_set(ctx->priv_data, "repeat-headers", "1", 0);
+    av_opt_set(ctx->priv_data, "profile", "baseline", 0);
 
     int encoder_API = avcodec_open2(ctx, codec, nullptr);
     if (encoder_API < 0)
@@ -348,6 +353,7 @@ int main(int argc, char** argv){
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
     );
     int frame_count = 0;
+    uint32_t tx_unit_id = 0; // her encoder çıktısı için benzersiz ID
     int fps_counter = 0;
     auto t0 = chrono::high_resolution_clock::now();
 
@@ -386,7 +392,17 @@ int main(int argc, char** argv){
         while (avcodec_receive_packet(ctx, pkt) == 0) {
             int encoded_size = pkt->size;
 
-            BuiltSlices built = build_slices_with_fec(pkt->data, static_cast<size_t>(pkt->size), mtu, static_cast<uint32_t>(frame_count));
+            bool is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+            if (is_key) {
+                // Anahtar karelerde FEC oranını arttırmak için global loss’a ek margin ver
+                // g_last_stats zaten r içinde dikkate alınıyor; burada opsiyonel olarak redundancy artırabiliriz
+                udp_sender.enable_redundancy( std::min<int>(3, std::max<int>(2, (int)receiver_ports.size()/2)) );
+            }
+            BuiltSlices built = build_slices_with_fec(pkt->data,
+                                                     static_cast<size_t>(pkt->size),
+                                                     mtu,
+                                                     tx_unit_id++,
+                                                     is_key);
 
             cout << "Frame #" << frame_count
                  << " | Raw: " << raw_size << " bytes"
