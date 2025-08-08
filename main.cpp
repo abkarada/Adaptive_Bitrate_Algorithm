@@ -7,6 +7,8 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <sstream>
+#include <string>
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
@@ -154,14 +156,51 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
 
 
 
-int main(){
+static std::vector<uint16_t> parse_ports_csv(const std::string& csv) {
+    std::vector<uint16_t> out;
+    std::stringstream ss(csv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) continue;
+        int v = std::stoi(item);
+        if (v > 0 && v < 65536) out.push_back(static_cast<uint16_t>(v));
+    }
+    return out;
+}
+
+static void print_usage_sender(const char* prog) {
+    std::cout << "Usage: " << prog << " --ip <receiver_ip> --ports <p1,p2,...> [--mtu <bytes>]" << std::endl;
+}
+
+int main(int argc, char** argv){
     Mat frame;
     VideoCapture cap;
     int bitrate = 400000;//->Siktiğimin şeyini Adaptive Yapıcam sonra
     int64_t counter = 0;
 
-    std::string receiver_ip = "192.168.1.100"; // Gerçek hedefin IP’si
+    std::string receiver_ip = "192.168.1.100"; // default target
     std::vector<uint16_t> receiver_ports = {4000, 4001, 4002, 4003, 4004};
+
+    // Parse CLI args
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--ip" && i + 1 < argc) {
+            receiver_ip = argv[++i];
+        } else if (arg == "--ports" && i + 1 < argc) {
+            receiver_ports = parse_ports_csv(argv[++i]);
+        } else if (arg == "--mtu" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v > 200 && v <= 2000) mtu = static_cast<size_t>(v);
+        } else if (arg == "-h" || arg == "--help") {
+            print_usage_sender(argv[0]);
+            return 0;
+        }
+    }
+    if (receiver_ports.empty()) {
+        std::cerr << "No receiver ports specified.\n";
+        print_usage_sender(argv[0]);
+        return 1;
+    }
 
     AdaptiveUDPSender udp_sender(receiver_ip, receiver_ports);
 

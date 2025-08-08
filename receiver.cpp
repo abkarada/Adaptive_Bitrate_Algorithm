@@ -5,6 +5,8 @@
 #include <thread>
 #include <cstring>
 #include <algorithm>
+#include <sstream>
+#include <string>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -204,10 +206,46 @@ static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_byt
     return true;
 }
 
-int main() {
-    // Config
-    const std::vector<uint16_t> listen_ports = {4000, 4001, 4002, 4003, 4004};
-    const size_t mtu = 1200;
+static std::vector<uint16_t> parse_ports_csv(const std::string& csv) {
+    std::vector<uint16_t> out;
+    std::stringstream ss(csv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) continue;
+        int v = std::stoi(item);
+        if (v > 0 && v < 65536) out.push_back(static_cast<uint16_t>(v));
+    }
+    return out;
+}
+
+static void print_usage_receiver(const char* prog) {
+    std::cout << "Usage: " << prog << " --ports <p1,p2,...> [--mtu <bytes>]" << std::endl;
+}
+
+int main(int argc, char** argv) {
+    // Defaults
+    std::vector<uint16_t> listen_ports = {4000, 4001, 4002, 4003, 4004};
+    size_t mtu = 1200;
+
+    // CLI
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--ports" && i + 1 < argc) {
+            listen_ports = parse_ports_csv(argv[++i]);
+        } else if (arg == "--mtu" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            if (v > 200 && v <= 2000) mtu = static_cast<size_t>(v);
+        } else if (arg == "-h" || arg == "--help") {
+            print_usage_receiver(argv[0]);
+            return 0;
+        }
+    }
+    if (listen_ports.empty()) {
+        std::cerr << "No listen ports specified.\n";
+        print_usage_receiver(argv[0]);
+        return 1;
+    }
+
     const size_t header_size = sizeof(SliceHeader);
     const size_t payload_size = mtu - header_size;
 
@@ -312,7 +350,7 @@ int main() {
                                                        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
                         cv::Mat img(frm->height, frm->width, CV_8UC3);
                         uint8_t* dst[] = { img.data, nullptr, nullptr, nullptr };
-                        int dstStride[] = { img.step[0], 0, 0, 0 };
+                        int dstStride[] = { static_cast<int>(img.step[0]), 0, 0, 0 };
                         sws_scale(sws, frm->data, frm->linesize, 0, frm->height, dst, dstStride);
                         cv::imshow("NovaEngine Receiver", img);
                         cv::waitKey(1);
