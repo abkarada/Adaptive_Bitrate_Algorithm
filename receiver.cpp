@@ -353,17 +353,16 @@ int main(int argc, char** argv) {
              // Try reconstruct
             std::vector<uint8_t> complete;
             if (try_reconstruct_frame(fb, complete)) {
-                // Decode with FFmpeg using owned buffer (avoids lifetime issues)
+                // Feed entire access unit directly (fps düşük, payload Annex B)
                 av_packet_unref(pkt);
                 if (av_new_packet(pkt, static_cast<int>(complete.size())) == 0) {
                     std::memcpy(pkt->data, complete.data(), complete.size());
                 } else {
                     continue;
                 }
-                 if (avcodec_send_packet(dctx, pkt) == 0) {
+                if (avcodec_send_packet(dctx, pkt) == 0) {
                     while (avcodec_receive_frame(dctx, frm) == 0) {
-                         // Drain all frames for this packet
-                        // Allocate sws on demand
+                        // Drain all frames for this packet
                         if (!sws) sws = sws_getContext(frm->width, frm->height, (AVPixelFormat)frm->format,
                                                        frm->width, frm->height, AV_PIX_FMT_BGR24,
                                                        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
@@ -391,6 +390,7 @@ int main(int argc, char** argv) {
     if (sws) sws_freeContext(sws);
     av_frame_free(&frm);
     av_packet_free(&pkt);
+    // no parser in use
     avcodec_free_context(&dctx);
     for (int fd : sockets) close(fd);
     close(epfd);
