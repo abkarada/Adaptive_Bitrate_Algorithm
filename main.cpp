@@ -13,6 +13,9 @@
 #include <sstream>
 #include <string>
 #include <cmath>
+#include <unordered_map>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
@@ -48,6 +51,17 @@ using namespace std;
 
 // Son profil istatistiklerini FEC r hesaplamasında kullanmak için global buffer
 std::vector<UDPChannelStat> g_last_stats;
+
+// Control channel for NACK (receiver -> sender)
+static constexpr uint16_t CTRL_NACK_PORT = 49000;
+#pragma pack(push, 1)
+struct NackPacket {
+    uint32_t magic = 0x4E41434Bu; // 'NACK'
+    uint32_t frame_id = 0;
+    uint16_t missing_count = 0;
+    uint16_t indices[128]{}; // up to 128 missing data slice indices
+};
+#pragma pack(pop)
 
 // === Transmission slice header and FEC builder ===
 #pragma pack(push, 1)
@@ -253,6 +267,41 @@ int main(int argc, char** argv){
 
     AdaptiveUDPSender udp_sender(receiver_ip, receiver_ports);
     
+    // ARQ cache for latest frame's data slices (for fast NACK responses)
+    struct ArqCacheEntry { uint32_t frame_id; std::unordered_map<uint16_t, std::vector<uint8_t>> data_slices; };
+    std::mutex arq_mtx;
+    ArqCacheEntry arq_cache{0, {}};
+
+    // NACK responder thread
+    std::atomic<bool> run_nack{true};
+    std::thread nack_thread([&]{
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(CTRL_NACK_PORT);
+        bind(sock, (sockaddr*)&addr, sizeof(addr));
+        while (run_nack.load()) {
+            NackPacket np{}; sockaddr_in from{}; socklen_t flen = sizeof(from);
+            ssize_t n = recvfrom(sock, &np, sizeof(np), 0, (sockaddr*)&from, &flen);
+            if (n != sizeof(NackPacket) || np.magic != 0x4E41434Bu) continue;
+            std::unordered_map<uint16_t, std::vector<uint8_t>> copy;
+            uint32_t fid;
+            {
+                std::lock_guard<std::mutex> lk(arq_mtx);
+                if (np.frame_id != arq_cache.frame_id) continue;
+                copy = arq_cache.data_slices;
+                fid = arq_cache.frame_id;
+            }
+            // resend requested slices directly to sender's normal data ports (primary port first)
+            for (uint16_t i = 0; i < np.missing_count; ++i) {
+                uint16_t idx = np.indices[i];
+                auto it = copy.find(idx);
+                if (it == copy.end()) continue;
+                std::vector<std::vector<uint8_t>> one{it->second};
+                udp_sender.send_slices(one);
+            }
+        }
+        close(sock);
+    });
+
     // Global paylaşımlı son profil istatistikleri
     
 
@@ -352,7 +401,9 @@ int main(int argc, char** argv){
     ctx->rc_buffer_size = current_bitrate * 2;
     ctx->rc_max_rate    = current_bitrate * 2;
     ctx->rc_min_rate    = std::max(current_bitrate / 2, 400000);
-    ctx->thread_count = 4; // CPU baskısını azaltarak sabit performans
+    // Increase encoder threading
+    unsigned hw_threads = std::max(2u, std::thread::hardware_concurrency());
+    ctx->thread_count = std::min<unsigned>(12, hw_threads); // cap to 12
     ctx->thread_type = FF_THREAD_FRAME;
 
     av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
@@ -455,6 +506,20 @@ int main(int argc, char** argv){
                                                                  mtu,
                                                                  tx_unit_id++,
                                                                  is_key);
+                        // Update ARQ cache with only data slices
+                        {
+                            std::lock_guard<std::mutex> lk(arq_mtx);
+                            arq_cache.data_slices.clear();
+                            uint32_t fid = 0;
+                            for (auto& sl : built.data_slices) {
+                                if (sl.size() >= sizeof(SliceHeader)) {
+                                    SliceHeader sh{}; std::memcpy(&sh, sl.data(), sizeof(SliceHeader));
+                                    fid = sh.frame_id;
+                                    arq_cache.data_slices[sh.slice_index] = sl; // copy
+                                }
+                            }
+                            arq_cache.frame_id = fid;
+                        }
                         cout << "Frame #" << frame_count
                              << " | Raw: " << raw_size << " bytes"
                              << " -> Encoded: " << encoded_size << " bytes"
@@ -467,7 +532,7 @@ int main(int argc, char** argv){
                             udp_sender.send_slices_parallel(built.data_slices);
                         }
                         if (!built.parity_slices.empty()) {
-                            for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
+                            udp_sender.send_slices_parallel(built.parity_slices);
                         }
                         av_packet_unref(pkt_filtered);
                     }
@@ -478,6 +543,20 @@ int main(int argc, char** argv){
                                                          mtu,
                                                          tx_unit_id++,
                                                          is_key);
+                // Update ARQ cache
+                {
+                    std::lock_guard<std::mutex> lk(arq_mtx);
+                    arq_cache.data_slices.clear();
+                    uint32_t fid = 0;
+                    for (auto& sl : built.data_slices) {
+                        if (sl.size() >= sizeof(SliceHeader)) {
+                            SliceHeader sh{}; std::memcpy(&sh, sl.data(), sizeof(SliceHeader));
+                            fid = sh.frame_id;
+                            arq_cache.data_slices[sh.slice_index] = sl;
+                        }
+                    }
+                    arq_cache.frame_id = fid;
+                }
                 cout << "Frame #" << frame_count
                      << " | Raw: " << raw_size << " bytes"
                      << " -> Encoded: " << encoded_size << " bytes"
@@ -486,9 +565,7 @@ int main(int argc, char** argv){
                      << " | total=" << (built.k + built.r)
                      << endl;
                 if (!built.data_slices.empty()) udp_sender.send_slices_parallel(built.data_slices);
-                if (!built.parity_slices.empty()) {
-                    for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
-                }
+                if (!built.parity_slices.empty()) udp_sender.send_slices_parallel(built.parity_slices);
             }
 
             av_packet_unref(pkt);
@@ -515,6 +592,8 @@ int main(int argc, char** argv){
     packet_q.push(Packet{}); // unblock
     if (sender_thread.joinable()) sender_thread.join();
     if (profiler_thread.joinable()) profiler_thread.join();
+    run_nack = false;
+    if (nack_thread.joinable()) nack_thread.join();
 
     return 0;
 

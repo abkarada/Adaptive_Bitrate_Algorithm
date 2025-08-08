@@ -8,6 +8,8 @@
 #include <sstream>
 #include <string>
 #include <set>
+#include <deque>
+#include <condition_variable>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -53,6 +55,16 @@ struct SliceHeader {
 
 static constexpr uint32_t SLICE_MAGIC = 0xABCD1234u;
 
+static constexpr uint16_t CTRL_NACK_PORT = 49000;
+#pragma pack(push, 1)
+struct NackPacket {
+    uint32_t magic = 0x4E41434Bu; // 'NACK'
+    uint32_t frame_id = 0;
+    uint16_t missing_count = 0;
+    uint16_t indices[128]{}; // up to 128 missing data slice indices
+};
+#pragma pack(pop)
+
 struct FrameBuffer {
     uint32_t frame_id = 0;
     uint16_t k = 0, r = 0, m = 0;
@@ -64,6 +76,9 @@ struct FrameBuffer {
     std::vector<uint8_t> parity_present; // r flags
     std::chrono::steady_clock::time_point first_seen;
     std::set<std::pair<uint16_t, uint16_t>> received_packets; // track (slice_index, port) to filter duplicates
+    std::chrono::steady_clock::time_point last_nack_sent{};
+    int nack_attempts = 0;
+    in_addr last_sender_ip{}; // for NACK target
 };
 
 static inline uint64_t now_us() {
@@ -281,6 +296,13 @@ int main(int argc, char** argv) {
     }
     if (sockets.empty()) { std::cerr << "No sockets bound" << std::endl; return 1; }
 
+    // Create NACK socket
+    int nack_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (nack_sock < 0) { perror("socket"); return 1; }
+    sockaddr_in nack_addr{}; nack_addr.sin_family = AF_INET; nack_addr.sin_port = htons(CTRL_NACK_PORT); nack_addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(nack_sock, (sockaddr*)&nack_addr, sizeof(nack_addr)) < 0) { perror("bind"); close(nack_sock); return 1; }
+    std::cout << "Listening NACK port " << CTRL_NACK_PORT << std::endl;
+
     // epoll
     int epfd = epoll_create1(0);
     if (epfd < 0) { perror("epoll_create1"); return 1; }
@@ -298,6 +320,40 @@ int main(int argc, char** argv) {
     AVFrame* frm = av_frame_alloc();
     AVPacket* pkt = av_packet_alloc();
     SwsContext* sws = nullptr;
+
+    // Simple decode-display worker queue
+    struct ImgTask { int w; int h; int fmt; std::array<uint8_t*,4> data; std::array<int,4> linesize; };
+    std::mutex q_mtx; std::condition_variable q_cv; std::deque<ImgTask> img_q;
+    std::atomic<bool> run_workers{true};
+    unsigned worker_threads = std::min<unsigned>(4, std::max(2u, std::thread::hardware_concurrency()/3));
+    std::vector<std::thread> workers;
+    workers.reserve(worker_threads);
+    for (unsigned t=0; t<worker_threads; ++t) {
+        workers.emplace_back([&]{
+            while (run_workers.load()) {
+                ImgTask task{};
+                {
+                    std::unique_lock<std::mutex> lk(q_mtx);
+                    q_cv.wait(lk, [&]{ return !img_q.empty() || !run_workers.load(); });
+                    if (!run_workers.load()) break;
+                    task = std::move(img_q.front());
+                    img_q.pop_front();
+                }
+                // Convert and display
+                SwsContext* lsws = sws_getContext(task.w, task.h, (AVPixelFormat)task.fmt,
+                                                  task.w, task.h, AV_PIX_FMT_BGR24,
+                                                  SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                if (!lsws) continue;
+                cv::Mat img(task.h, task.w, CV_8UC3);
+                uint8_t* dst[] = { img.data, nullptr, nullptr, nullptr };
+                int dstStride[] = { static_cast<int>(img.step[0]), 0, 0, 0 };
+                sws_scale(lsws, task.data.data(), task.linesize.data(), 0, task.h, dst, dstStride);
+                sws_freeContext(lsws);
+                cv::imshow("NovaEngine Receiver", img);
+                cv::waitKey(1);
+            }
+        });
+    }
 
     std::unordered_map<uint32_t, FrameBuffer> frames;
     // Smart buffer window depends on number of ports: more ports -> slightly larger window
@@ -349,8 +405,13 @@ int main(int argc, char** argv) {
                 fb.data_present.assign(fb.k, 0);
                 fb.parity_present.assign(fb.r, 0);
                 fb.first_seen = std::chrono::steady_clock::now();
+                fb.last_sender_ip = from.sin_addr;
+                fb.last_nack_sent = fb.first_seen - std::chrono::milliseconds(1000);
+                fb.nack_attempts = 0;
+            } else {
+                fb.last_sender_ip = from.sin_addr;
             }
-
+            
             // Check for duplicate packets from multiple tunnels
             uint16_t recv_port = ntohs(from.sin_port);
             auto packet_id = std::make_pair(sh.slice_index, recv_port);
@@ -384,6 +445,31 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // After updating presence, evaluate NACK need for data slices
+            int have_data = 0; for (int di = 0; di < fb.k; ++di) have_data += fb.data_present[di] ? 1 : 0;
+            int present_total = have_data; for (int pi = 0; pi < fb.r; ++pi) present_total += fb.parity_present[pi] ? 1 : 0;
+            bool complete_or_recoverable = (have_data == fb.k) || (present_total >= fb.k);
+            auto nowtp = std::chrono::steady_clock::now();
+            auto since_first = std::chrono::duration_cast<std::chrono::milliseconds>(nowtp - fb.first_seen).count();
+            auto since_last_nack = std::chrono::duration_cast<std::chrono::milliseconds>(nowtp - fb.last_nack_sent).count();
+            if (!complete_or_recoverable && since_first >= 8 && since_last_nack >= 8 && fb.nack_attempts < 4) {
+                // Build NACK for missing data slices only (0..k-1)
+                NackPacket nack{};
+                nack.frame_id = fb.frame_id;
+                nack.missing_count = 0;
+                for (uint16_t di = 0; di < fb.k && nack.missing_count < 128; ++di) {
+                    if (!fb.data_present[di]) {
+                        nack.indices[nack.missing_count++] = di;
+                    }
+                }
+                if (nack.missing_count > 0) {
+                    sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(CTRL_NACK_PORT); to.sin_addr = fb.last_sender_ip;
+                    sendto(nack_sock, &nack, sizeof(nack), 0, (sockaddr*)&to, sizeof(to));
+                    fb.last_nack_sent = nowtp;
+                    fb.nack_attempts++;
+                }
+            }
+            
              // Try reconstruct
             std::vector<uint8_t> complete;
             if (try_reconstruct_frame(fb, complete)) {
@@ -396,19 +482,14 @@ int main(int argc, char** argv) {
                 }
                 if (avcodec_send_packet(dctx, pkt) == 0) {
                     while (avcodec_receive_frame(dctx, frm) == 0) {
-                        // Drain all frames for this packet
-                        if (!sws) sws = sws_getContext(frm->width, frm->height, (AVPixelFormat)frm->format,
-                                                       frm->width, frm->height, AV_PIX_FMT_BGR24,
-                                                       SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-                        if (!sws) break;
-                        cv::Mat img(frm->height, frm->width, CV_8UC3);
-                        uint8_t* dst[] = { img.data, nullptr, nullptr, nullptr };
-                        int dstStride[] = { static_cast<int>(img.step[0]), 0, 0, 0 };
-                        sws_scale(sws, frm->data, frm->linesize, 0, frm->height, dst, dstStride);
-                        
-                        // No FPS limiting - display immediately for minimum latency
-                        cv::imshow("NovaEngine Receiver", img);
-                        cv::waitKey(1); // Minimal wait for OpenCV event processing
+                        // Enqueue for workers
+                        ImgTask task{}; task.w = frm->width; task.h = frm->height; task.fmt = frm->format;
+                        for (int p=0;p<4;++p){ task.data[p]=frm->data[p]; task.linesize[p]=frm->linesize[p]; }
+                        {
+                            std::lock_guard<std::mutex> lk(q_mtx);
+                            img_q.emplace_back(std::move(task));
+                        }
+                        q_cv.notify_one();
                     }
                 }
                 frames.erase(sh.frame_id);
@@ -423,6 +504,9 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
+    run_workers = false;
+    q_cv.notify_all();
+    for (auto& th : workers) if (th.joinable()) th.join();
     if (sws) sws_freeContext(sws);
     av_frame_free(&frm);
     av_packet_free(&pkt);
@@ -430,6 +514,7 @@ int main(int argc, char** argv) {
     avcodec_free_context(&dctx);
     for (int fd : sockets) close(fd);
     close(epfd);
+    if (nack_sock >= 0) close(nack_sock);
     return 0;
 }
 
