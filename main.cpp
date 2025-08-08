@@ -285,7 +285,7 @@ int main(int argc, char** argv){
             // Global istatistikleri güncelle
             g_last_stats = stats;
 
-            // simple bitrate adaptation based on average loss
+            // Less aggressive bitrate adaptation - stabilized for smooth playback
             double loss_sum = 0.0;
             double rtt_sum = 0.0;
             for (const auto& s : stats) { loss_sum += s.packet_loss; rtt_sum += s.avg_rtt_ms; }
@@ -295,18 +295,20 @@ int main(int argc, char** argv){
             int cur = target_bitrate.load();
             int new_bitrate = cur;
 
-            // Lokal ağda hedef: sabit yüksek. Sadece aşırı kayıpta az indir, hızlı geri dön
-            if (avg_loss > 0.30) new_bitrate = std::max(cur * 85 / 100, 1200000);
-            else if (avg_loss > 0.15) new_bitrate = std::max(cur * 92 / 100, 1300000);
-            else if (avg_loss < 0.05) new_bitrate = std::min(cur * 110 / 100, 3000000);
+            // Much less aggressive changes - avoid constant encoder adjustments
+            if (avg_loss > 0.50) new_bitrate = std::max(cur * 90 / 100, 1500000);      // Only severe loss
+            else if (avg_loss < 0.02) new_bitrate = std::min(cur * 105 / 100, 2500000); // Only very low loss
 
             // Tek kanalda clone = 1; çok kanalda kayba göre 1..3
             int new_redundancy = (receiver_ports.size() > 1) ? (avg_loss > 0.10 ? 3 : (avg_loss > 0.03 ? 2 : 1)) : 1;
             udp_sender.enable_redundancy(new_redundancy);
 
-            if (new_bitrate != cur) target_bitrate.store(new_bitrate);
+            // Only change bitrate if significant difference (>200kbps)
+            if (abs(new_bitrate - cur) > 200000) {
+                target_bitrate.store(new_bitrate);
+            }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Update every 1 second instead of 300ms
         }
     });
 
