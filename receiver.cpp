@@ -207,7 +207,10 @@ static std::vector<uint16_t> parse_ports_csv(const std::string& csv) {
 }
 
 static void print_usage_receiver(const char* prog) {
-    std::cout << "Usage: " << prog << " --ports <p1,p2,...> [--mtu <bytes>]" << std::endl;
+    std::cout << "Usage: " << prog << " [--ports <p1,p2,...> | --port <p>] [--mtu <bytes>]" << std::endl;
+    std::cout << "  examples:\n"
+              << "    " << prog << " --port 4000 --mtu 1200\n"
+              << "    " << prog << " --ports 4000,4001,4002 --mtu 1200\n";
 }
 
 int main(int argc, char** argv) {
@@ -220,6 +223,9 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--ports" && i + 1 < argc) {
             listen_ports = parse_ports_csv(argv[++i]);
+        } else if (arg == "--port" && i + 1 < argc) {
+            int p = std::stoi(argv[++i]);
+            if (p > 0 && p < 65536) listen_ports = { static_cast<uint16_t>(p) };
         } else if (arg == "--mtu" && i + 1 < argc) {
             int v = std::stoi(argv[++i]);
             if (v > 200 && v <= 2000) mtu = static_cast<size_t>(v);
@@ -235,7 +241,7 @@ int main(int argc, char** argv) {
     }
 
     const size_t header_size = sizeof(SliceHeader);
-    const size_t payload_size = mtu - header_size;
+    const size_t payload_size_default = mtu > header_size ? (mtu - header_size) : 0;
 
     // Sockets
     std::vector<int> sockets;
@@ -272,7 +278,8 @@ int main(int argc, char** argv) {
 
     cv::namedWindow("NovaEngine Receiver", cv::WINDOW_AUTOSIZE);
 
-    std::vector<uint8_t> rxbuf(mtu);
+    size_t rxbuf_capacity = std::max<size_t>(mtu, 2048);
+    std::vector<uint8_t> rxbuf(rxbuf_capacity);
     epoll_event events[32];
 
     while (true) {
@@ -296,6 +303,7 @@ int main(int argc, char** argv) {
             if (n < (ssize_t)sizeof(SliceHeader)) continue;
             SliceHeader sh{}; std::memcpy(&sh, rxbuf.data(), sizeof(SliceHeader));
             if (sh.magic != SLICE_MAGIC) continue;
+            const size_t recv_payload = static_cast<size_t>(n) - header_size;
 
             // Initialize frame buffer if first time
             auto& fb = frames[sh.frame_id];
@@ -303,10 +311,11 @@ int main(int argc, char** argv) {
                 fb.frame_id = sh.frame_id;
                 fb.k = sh.k_data; fb.r = sh.r_parity; fb.m = sh.total_slices;
                 // Trust sender-advertised payload_bytes to avoid MTU mismatch
-                fb.payload_size = sh.payload_bytes ? sh.payload_bytes : static_cast<uint16_t>(payload_size);
+                size_t alloc_payload = sh.payload_bytes ? sh.payload_bytes : payload_size_default;
+                fb.payload_size = static_cast<uint16_t>(alloc_payload);
                 fb.total_frame_bytes = sh.total_frame_bytes;
-                fb.data_blocks.assign(fb.k, std::vector<uint8_t>(payload_size));
-                fb.parity_blocks.assign(fb.r, std::vector<uint8_t>(payload_size));
+                fb.data_blocks.assign(fb.k, std::vector<uint8_t>(fb.payload_size));
+                fb.parity_blocks.assign(fb.r, std::vector<uint8_t>(fb.payload_size));
                 fb.data_present.assign(fb.k, 0);
                 fb.parity_present.assign(fb.r, 0);
                 fb.first_seen = std::chrono::steady_clock::now();
@@ -314,12 +323,14 @@ int main(int argc, char** argv) {
 
             const uint8_t* payload = rxbuf.data() + sizeof(SliceHeader);
             if (sh.slice_index < fb.k) {
-                std::memcpy(fb.data_blocks[sh.slice_index].data(), payload, payload_size);
+                size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
+                std::memcpy(fb.data_blocks[sh.slice_index].data(), payload, copy_len);
                 fb.data_present[sh.slice_index] = 1;
             } else {
                 uint16_t pi = static_cast<uint16_t>(sh.slice_index - fb.k);
                 if (pi < fb.r) {
-                    std::memcpy(fb.parity_blocks[pi].data(), payload, payload_size);
+                    size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
+                    std::memcpy(fb.parity_blocks[pi].data(), payload, copy_len);
                     fb.parity_present[pi] = 1;
                 }
             }

@@ -28,6 +28,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavcodec/bsf.h>
 }
 
 
@@ -345,6 +346,7 @@ int main(int argc, char** argv){
     av_image_alloc(yuv->data, yuv->linesize, WIDTH, HEIGHT, ctx->pix_fmt, 1);
 
     AVPacket* pkt = av_packet_alloc();
+    AVPacket* pkt_filtered = av_packet_alloc();
 
     //OpenCV -->BGR input --Translation via SwsContext-->YUV420P -->AVFrame
     SwsContext* sws = sws_getContext(
@@ -356,6 +358,20 @@ int main(int argc, char** argv){
     uint32_t tx_unit_id = 0; // her encoder çıktısı için benzersiz ID
     int fps_counter = 0;
     auto t0 = chrono::high_resolution_clock::now();
+
+    // Initialize H.264 bitstream filter to ensure Annex B format
+    const AVBitStreamFilter* bsf_filter = av_bsf_get_by_name("h264_mp4toannexb");
+    AVBSFContext* bsf_ctx = nullptr;
+    if (bsf_filter) {
+        av_bsf_alloc(bsf_filter, &bsf_ctx);
+        avcodec_parameters_from_context(bsf_ctx->par_in, ctx);
+        bsf_ctx->time_base_in = ctx->time_base;
+        if (av_bsf_init(bsf_ctx) < 0) {
+            std::cerr << "Failed to init h264_mp4toannexb bitstream filter" << std::endl;
+            av_bsf_free(&bsf_ctx);
+            bsf_ctx = nullptr;
+        }
+    }
 
     while(cap.read(frame)){
         // dynamic bitrate adjustment
@@ -398,25 +414,58 @@ int main(int argc, char** argv){
                 // g_last_stats zaten r içinde dikkate alınıyor; burada opsiyonel olarak redundancy artırabiliriz
                 udp_sender.enable_redundancy( std::min<int>(3, std::max<int>(2, (int)receiver_ports.size()/2)) );
             }
-            BuiltSlices built = build_slices_with_fec(pkt->data,
-                                                     static_cast<size_t>(pkt->size),
-                                                     mtu,
-                                                     tx_unit_id++,
-                                                     is_key);
+            const uint8_t* send_data = pkt->data;
+            size_t send_size = static_cast<size_t>(pkt->size);
+            AVPacket* use_pkt = pkt;
 
-            cout << "Frame #" << frame_count
-                 << " | Raw: " << raw_size << " bytes"
-                 << " -> Encoded: " << encoded_size << " bytes"
-                 << " | k=" << built.k
-                 << " r=" << built.r
-                 << " | total=" << (built.k + built.r)
-                 << endl;
+            if (bsf_ctx) {
+                // Run through bitstream filter to convert to Annex B
+                if (av_bsf_send_packet(bsf_ctx, pkt) == 0) {
+                    while (av_bsf_receive_packet(bsf_ctx, pkt_filtered) == 0) {
+                        send_data = pkt_filtered->data;
+                        send_size = static_cast<size_t>(pkt_filtered->size);
+                        is_key = (pkt_filtered->flags & AV_PKT_FLAG_KEY) != 0;
 
-            if (!built.data_slices.empty()) {
-                for(auto &sl: built.data_slices) packet_q.push(Packet{std::move(sl)});
-            }
-            if (!built.parity_slices.empty()) {
-                for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
+                        BuiltSlices built = build_slices_with_fec(send_data,
+                                                                 send_size,
+                                                                 mtu,
+                                                                 tx_unit_id++,
+                                                                 is_key);
+                        cout << "Frame #" << frame_count
+                             << " | Raw: " << raw_size << " bytes"
+                             << " -> Encoded: " << encoded_size << " bytes"
+                             << " | k=" << built.k
+                             << " r=" << built.r
+                             << " | total=" << (built.k + built.r)
+                             << endl;
+                        if (!built.data_slices.empty()) {
+                            for(auto &sl: built.data_slices) packet_q.push(Packet{std::move(sl)});
+                        }
+                        if (!built.parity_slices.empty()) {
+                            for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
+                        }
+                        av_packet_unref(pkt_filtered);
+                    }
+                }
+            } else {
+                BuiltSlices built = build_slices_with_fec(send_data,
+                                                         send_size,
+                                                         mtu,
+                                                         tx_unit_id++,
+                                                         is_key);
+                cout << "Frame #" << frame_count
+                     << " | Raw: " << raw_size << " bytes"
+                     << " -> Encoded: " << encoded_size << " bytes"
+                     << " | k=" << built.k
+                     << " r=" << built.r
+                     << " | total=" << (built.k + built.r)
+                     << endl;
+                if (!built.data_slices.empty()) {
+                    for(auto &sl: built.data_slices) packet_q.push(Packet{std::move(sl)});
+                }
+                if (!built.parity_slices.empty()) {
+                    for(auto &sl: built.parity_slices) packet_q.push(Packet{std::move(sl)});
+                }
             }
 
             av_packet_unref(pkt);
@@ -430,6 +479,8 @@ int main(int argc, char** argv){
 
     av_frame_free(&yuv);
     av_packet_free(&pkt);
+    av_packet_free(&pkt_filtered);
+    if (bsf_ctx) av_bsf_free(&bsf_ctx);
     sws_freeContext(sws);
     avcodec_free_context(&ctx);
     cap.release();
