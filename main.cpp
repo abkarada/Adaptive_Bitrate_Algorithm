@@ -41,7 +41,7 @@ extern "C" {
 
 // k ve r dinamik hesaplanacak, burada sabitler kullanılmıyor
 
-static size_t mtu = 1200;
+static size_t mtu = 800; // Smaller MTU for better network reliability
 
 using namespace cv;
 using namespace std;
@@ -61,7 +61,7 @@ struct SliceHeader {
     uint16_t payload_bytes = 0; // payload size used for RS
     uint32_t total_frame_bytes = 0; // encoded size of this block
     uint64_t timestamp_us = 0;
-    uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe
+    uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe, bit2: critical_packet
     uint32_t checksum = 0; // FNV-1a over payload_bytes
 };
 #pragma pack(pop)
@@ -112,10 +112,21 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         for (const auto& s : g_last_stats) avg_loss += s.packet_loss;
         avg_loss /= g_last_stats.size();
     }
-    // Temel kural: hedef kurtarma oranı ~ avg_loss marjlı
-    // r ≈ ceil(k * min(0.5, avg_loss * 1.5) ) sınırlarıyla
-    double fec_ratio = std::min(0.5, avg_loss * 1.5 + 0.01); // + küçük güvenlik payı
-    r_parity = std::clamp(static_cast<int>(std::ceil(k_data * fec_ratio)), 1, std::max(2, k_data));
+    // Much more aggressive FEC for real network conditions
+    // Minimum 40% redundancy, up to 80% for high loss
+    double base_redundancy = 0.4; // 40% minimum redundancy
+    double extra_redundancy = avg_loss * 2.0; // 2x of measured loss
+    double fec_ratio = std::min(0.8, base_redundancy + extra_redundancy);
+    r_parity = std::clamp(static_cast<int>(std::ceil(k_data * fec_ratio)), 
+                         std::max(1, k_data * 2 / 5), // min 40% of k
+                         std::max(3, k_data * 4 / 5)); // max 80% of k
+    
+    // Extra redundancy for keyframes - critical for video quality
+    if (is_keyframe) {
+        r_parity = std::clamp(static_cast<int>(r_parity * 1.5), 
+                             std::max(2, k_data / 2), // min 50% for keyframes
+                             k_data); // max 100% for keyframes
+    }
 
     out.k = k_data; out.r = r_parity;
 
