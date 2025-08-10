@@ -2,23 +2,16 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
-
 #include <algorithm>
 #include <thread>
 #include <atomic>
 #include <chrono>
 #include <mutex>
-#include <queue>
-#include <condition_variable>
 #include <sstream>
 #include <string>
-#include <cmath>
-#include <unordered_map>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
-
-#include <pthread.h>   // <-- eklendi (CPU affinity için)
-#include <sched.h>     // <-- eklendi
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
@@ -37,48 +30,32 @@ extern "C" {
 #include <libavcodec/bsf.h>
 }
 
-#define Device_ID 0
+using namespace std;
+using namespace cv;
+
+#define DEVICE_ID 0
 #define WIDTH 640
 #define HEIGHT 480
 #define FPS 30
 
-// MTU sabit: fragmentation önleme
-static size_t mtu = 1000;
-
-using namespace cv;
-using namespace std;
-
-// Son profil istatistiklerini FEC r hesaplamasında kullanmak için global buffer
+static std::atomic<size_t> g_mtu_bytes{1000};
 std::vector<UDPChannelStat> g_last_stats;
 
-// (şu an kontrol kanalı kullanılmıyor ama header dursun)
-static constexpr uint16_t CTRL_NACK_PORT = 49000;
-#pragma pack(push, 1)
-struct NackPacket {
-    uint32_t magic = 0x4E41434Bu; // 'NACK'
-    uint32_t frame_id = 0;
-    uint16_t missing_count = 0;
-    uint16_t indices[128]{}; // up to 128 missing data slice indices
-};
-#pragma pack(pop)
-
-// === Transmission slice header and FEC builder ===
 #pragma pack(push, 1)
 struct SliceHeader {
     uint32_t magic = 0xABCD1234;
     uint32_t frame_id = 0;
     uint16_t slice_index = 0;
-    uint16_t total_slices = 0; // k + r
+    uint16_t total_slices = 0;
     uint16_t k_data = 0;
     uint16_t r_parity = 0;
-    uint16_t payload_bytes = 0; // payload size used for RS
-    uint32_t total_frame_bytes = 0; // encoded size of this block
+    uint16_t payload_bytes = 0;
+    uint32_t total_frame_bytes = 0;
     uint64_t timestamp_us = 0;
-    uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe
-    uint32_t checksum = 0; // FNV-1a over payload_bytes
+    uint8_t  flags = 0; // bit0 parity, bit1 key
+    uint32_t checksum = 0;
 };
 #pragma pack(pop)
-static_assert(sizeof(SliceHeader) >= 1, "SliceHeader sanity");
 
 struct BuiltSlices {
     std::vector<std::vector<uint8_t>> data_slices;
@@ -89,37 +66,30 @@ struct BuiltSlices {
 
 static inline uint64_t now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
-               std::chrono::high_resolution_clock::now().time_since_epoch())
-        .count();
+               std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
 
-BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_bytes, uint32_t frame_id, bool is_keyframe) {
+static BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_bytes, uint32_t frame_id, bool is_keyframe) {
     BuiltSlices out{};
-    const size_t header_size = sizeof(SliceHeader);
-    if (mtu_bytes <= header_size) return out;
+    const size_t H = sizeof(SliceHeader);
+    if (mtu_bytes <= H) return out;
 
-    const size_t payload_size = mtu_bytes - header_size;
-    int k_data = static_cast<int>((size + payload_size - 1) / payload_size);
-    if (k_data <= 0) k_data = 1;
+    const size_t payload = mtu_bytes - H;
+    int k = (int)((size + payload - 1) / payload);
+    if (k <= 0) k = 1;
 
-    // Dinamik r belirleme: son profil metriklerine göre
-    int r_parity = 1;
+    // daha makul FEC: taban %12, loss ile art, cap %35
     double avg_loss = 0.0;
     if (!g_last_stats.empty()) {
-        for (const auto& s : g_last_stats) avg_loss += s.packet_loss;
+        for (auto& s : g_last_stats) avg_loss += s.packet_loss;
         avg_loss /= g_last_stats.size();
     }
-    // Base 20% + loss'a göre artış, hard cap 50%
-    double base_redundancy = 0.20;
-    double loss_factor = avg_loss > 0.01 ? avg_loss : 0.01;
-    double fec_ratio = std::min(0.5, base_redundancy + loss_factor * 1.5);
-    r_parity = std::clamp(static_cast<int>(std::ceil(k_data * fec_ratio)),
-                          2, std::max(4, k_data / 2));
-    if (is_keyframe) {
-        r_parity = std::min(r_parity + 2, k_data * 2 / 3);
-    }
+    double base = 0.12, cap = 0.35;
+    double fec_ratio = std::min(cap, base + std::max(0.01, avg_loss) * 1.2);
+    int r = std::clamp((int)std::ceil(k * fec_ratio), 1, std::max(3, k/3));
+    if (is_keyframe) r = std::min(r + 1, std::max(4, k/2)); // keyframe'e hafif bonus
 
-    out.k = k_data; out.r = r_parity;
+    out.k = k; out.r = r;
 
     auto fnv1a = [](const uint8_t* p, size_t n){
         uint32_t h = 2166136261u;
@@ -127,203 +97,161 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         return h;
     };
 
-    out.data_slices.resize(k_data);
-    size_t src_off = 0;
-    for (int i = 0; i < k_data; ++i) {
+    out.data_slices.resize(k);
+    size_t off = 0;
+    for (int i=0;i<k;++i) {
         out.data_slices[i].assign(mtu_bytes, 0);
-        SliceHeader hdr{};
-        hdr.frame_id = frame_id;
-        hdr.slice_index = static_cast<uint16_t>(i);
-        hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
-        hdr.k_data = static_cast<uint16_t>(k_data);
-        hdr.r_parity = static_cast<uint16_t>(r_parity);
-        hdr.payload_bytes = static_cast<uint16_t>(payload_size);
-        hdr.total_frame_bytes = static_cast<uint32_t>(size);
-        hdr.timestamp_us = now_us();
-        hdr.flags = is_keyframe ? 0x02 : 0x00; // bit1: keyframe
-        std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
+        SliceHeader h{};
+        h.frame_id = frame_id; h.slice_index=(uint16_t)i;
+        h.total_slices=(uint16_t)(k+r); h.k_data=(uint16_t)k; h.r_parity=(uint16_t)r;
+        h.payload_bytes=(uint16_t)payload; h.total_frame_bytes=(uint32_t)size;
+        h.timestamp_us = now_us(); h.flags = is_keyframe?0x02:0x00;
+        std::memcpy(out.data_slices[i].data(), &h, sizeof(SliceHeader));
 
-        size_t remain = (src_off < size) ? (size - src_off) : 0;
-        size_t copy_len = std::min(payload_size, remain);
-        if (copy_len > 0) {
-            std::memcpy(out.data_slices[i].data() + header_size, data + src_off, copy_len);
-            hdr.checksum = fnv1a(out.data_slices[i].data() + header_size, payload_size);
-            std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
-            src_off += copy_len;
-        } else {
-            hdr.checksum = fnv1a(out.data_slices[i].data() + header_size, payload_size);
-            std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
-        }
+        size_t rem = (off < size) ? (size - off) : 0;
+        size_t cp  = std::min(payload, rem);
+        if (cp) std::memcpy(out.data_slices[i].data()+H, data+off, cp);
+        h.checksum = fnv1a(out.data_slices[i].data()+H, payload);
+        std::memcpy(out.data_slices[i].data(), &h, sizeof(SliceHeader));
+        off += cp;
     }
 
-    if (k_data >= 2) {
-        std::vector<uint8_t*> data_ptrs(static_cast<size_t>(k_data));
-        for (int i = 0; i < k_data; ++i) data_ptrs[i] = out.data_slices[i].data() + header_size;
+    if (k >= 2) {
+        std::vector<uint8_t*> dptr((size_t)k);
+        for (int i=0;i<k;++i) dptr[i] = out.data_slices[i].data() + H;
 
-        std::vector<std::vector<uint8_t>> parity_payloads(r_parity, std::vector<uint8_t>(payload_size));
-        std::vector<uint8_t*> parity_ptrs(static_cast<size_t>(r_parity));
-        for (int i = 0; i < r_parity; ++i) parity_ptrs[i] = parity_payloads[i].data();
+        std::vector<std::vector<uint8_t>> pbuf((size_t)r, std::vector<uint8_t>(payload));
+        std::vector<uint8_t*> pptr((size_t)r);
+        for (int i=0;i<r;++i) pptr[i] = pbuf[i].data();
 
-        std::vector<uint8_t> matrix(static_cast<size_t>(k_data + r_parity) * static_cast<size_t>(k_data));
-        std::vector<uint8_t> g_tbls(static_cast<size_t>(k_data) * static_cast<size_t>(r_parity) * 32);
-        gf_gen_rs_matrix(matrix.data(), k_data + r_parity, k_data);
-        ec_init_tables(k_data, r_parity, matrix.data() + k_data * k_data, g_tbls.data());
-        ec_encode_data(static_cast<int>(payload_size), k_data, r_parity, g_tbls.data(), data_ptrs.data(), parity_ptrs.data());
+        std::vector<uint8_t> M((size_t)(k+r)*(size_t)k);
+        std::vector<uint8_t> tbl((size_t)k*(size_t)r*32);
+        gf_gen_rs_matrix(M.data(), k+r, k);
+        ec_init_tables(k, r, M.data()+k*k, tbl.data());
+        ec_encode_data((int)payload, k, r, tbl.data(), dptr.data(), pptr.data());
 
-        out.parity_slices.resize(r_parity);
-        for (int i = 0; i < r_parity; ++i) {
+        out.parity_slices.resize(r);
+        for (int i=0;i<r;++i) {
             out.parity_slices[i].assign(mtu_bytes, 0);
-            SliceHeader hdr{};
-            hdr.frame_id = frame_id;
-            hdr.slice_index = static_cast<uint16_t>(k_data + i);
-            hdr.total_slices = static_cast<uint16_t>(k_data + r_parity);
-            hdr.k_data = static_cast<uint16_t>(k_data);
-            hdr.r_parity = static_cast<uint16_t>(r_parity);
-            hdr.payload_bytes = static_cast<uint16_t>(payload_size);
-            hdr.total_frame_bytes = static_cast<uint32_t>(size);
-            hdr.timestamp_us = now_us();
-            hdr.flags = static_cast<uint8_t>(0x01 | (is_keyframe ? 0x02 : 0x00)); // parity + keyframe
-            std::memcpy(out.parity_slices[i].data(), &hdr, sizeof(SliceHeader));
-            std::memcpy(out.parity_slices[i].data() + header_size, parity_payloads[i].data(), payload_size);
-            hdr.checksum = fnv1a(out.parity_slices[i].data() + header_size, payload_size);
-            std::memcpy(out.parity_slices[i].data(), &hdr, sizeof(SliceHeader));
+            SliceHeader h{};
+            h.frame_id=frame_id; h.slice_index=(uint16_t)(k+i);
+            h.total_slices=(uint16_t)(k+r); h.k_data=(uint16_t)k; h.r_parity=(uint16_t)r;
+            h.payload_bytes=(uint16_t)payload; h.total_frame_bytes=(uint32_t)size;
+            h.timestamp_us = now_us(); h.flags = (uint8_t)(0x01 | (is_keyframe?0x02:0x00));
+            std::memcpy(out.parity_slices[i].data(), &h, sizeof(SliceHeader));
+            std::memcpy(out.parity_slices[i].data()+H, pbuf[i].data(), payload);
+            h.checksum = fnv1a(out.parity_slices[i].data()+H, payload);
+            std::memcpy(out.parity_slices[i].data(), &h, sizeof(SliceHeader));
         }
     }
-
     return out;
 }
 
 static std::vector<uint16_t> parse_ports_csv(const std::string& csv) {
-    std::vector<uint16_t> out;
-    std::stringstream ss(csv);
-    std::string item;
+    std::vector<uint16_t> out; std::stringstream ss(csv); std::string item;
     while (std::getline(ss, item, ',')) {
-        if (item.empty()) continue;
-        int v = std::stoi(item);
-        if (v > 0 && v < 65536) out.push_back(static_cast<uint16_t>(v));
+        if (item.empty()) continue; int v=std::stoi(item);
+        if (v>0 && v<65536) out.push_back((uint16_t)v);
     }
     return out;
 }
 
-static void print_usage_sender(const char* prog) {
-    std::cout << "Usage: " << prog << " --ip <receiver_ip> --ports <p1,p2,...> [--mtu <bytes>]" << std::endl;
+static void usage(const char* p) {
+    std::cout << "Usage: " << p << " --ip <receiver_ip> --ports <p1,p2,...> [--mtu <bytes>] [--bitrate <bps>]\n";
 }
 
-int main(int argc, char** argv){
-    Mat frame;
-    VideoCapture cap;
-    int bitrate = 5'000'000; // 5 Mbps
+int main(int argc, char** argv) {
+    std::string receiver_ip = "127.0.0.1";
+    std::vector<uint16_t> receiver_ports = {4000,4001,4002,4003,4004};
+    int bitrate = 5'000'000;
+
+    for (int i=1;i<argc;++i) {
+        std::string a = argv[i];
+        if (a=="--ip" && i+1<argc) receiver_ip = argv[++i];
+        else if (a=="--ports" && i+1<argc) receiver_ports = parse_ports_csv(argv[++i]);
+        else if (a=="--mtu" && i+1<argc) { int v=std::stoi(argv[++i]); if (v>200 && v<=2000) g_mtu_bytes.store((size_t)v); }
+        else if (a=="--bitrate" && i+1<argc) { bitrate = std::max(200000, std::stoi(argv[++i])); }
+        else if (a=="-h"||a=="--help") { usage(argv[0]); return 0; }
+    }
+    if (receiver_ports.empty()) { std::cerr<<"No receiver ports\n"; return 1; }
+
     std::atomic<int> target_bitrate{bitrate};
 
-    std::string receiver_ip = "192.168.1.100"; // default target
-    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002, 4003, 4004};
-
-    // CLI
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--ip" && i + 1 < argc) {
-            receiver_ip = argv[++i];
-        } else if (arg == "--ports" && i + 1 < argc) {
-            receiver_ports = parse_ports_csv(argv[++i]);
-        } else if (arg == "--mtu" && i + 1 < argc) {
-            int v = std::stoi(argv[++i]);
-            if (v > 200 && v <= 2000) mtu = (size_t)v;
-        } else if (arg == "-h" || arg == "--help") {
-            print_usage_sender(argv[0]); return 0;
-        }
-    }
-    if (receiver_ports.empty()) {
-        std::cerr << "No receiver ports specified.\n";
-        print_usage_sender(argv[0]);
-        return 1;
-    }
-
     AdaptiveUDPSender udp_sender(receiver_ip, receiver_ports);
-    // toplam bitrate’i pacing’e bildir
     udp_sender.set_total_rate_bps(target_bitrate.load());
+    udp_sender.enable_redundancy(2); // başlangıç için makul
 
-    // Redundancy başlangıcı (profilere göre aşağıda dinamik güncelleniyor)
-    udp_sender.enable_redundancy(4);
-
-    // thread-safe queue (şu an aktif kullanılmıyor ama kalabilir)
-    struct Packet { std::vector<uint8_t> data; };
-    class PacketQ {
-        std::queue<Packet> q; std::mutex m; std::condition_variable cv;
-    public:
-        void push(Packet &&p){ std::lock_guard<std::mutex> lk(m); q.push(std::move(p)); cv.notify_one(); }
-        bool pop(Packet &out){ std::unique_lock<std::mutex> lk(m); cv.wait(lk,[&]{return !q.empty();}); out = std::move(q.front()); q.pop(); return true; }
-    } packet_q;
-
-    // sender thread (şu an kullanılmıyor; yine de bırakıyoruz)
-    std::atomic<bool> run_sender{true};
-    std::thread sender_thread([&](){
-        cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(0, &cp);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
-        Packet pktv;
-        while(true){
-            packet_q.pop(pktv);
-            if(!run_sender.load() && pktv.data.empty()) break;
-            if(pktv.data.empty()) continue;
-            std::vector<std::vector<uint8_t>> one{std::move(pktv.data)};
-            udp_sender.send_slices(one);
-        }
-    });
-
-    // profiler
+    // === PROFILER THREAD ===
     UDPPortProfiler profiler(receiver_ip, receiver_ports);
-    std::atomic<bool> run_profiler{true};
-    std::thread profiler_thread([&](){
-        cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(1, &cp);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
-        while (run_profiler.load()) {
+    std::atomic<bool> run_prof{true};
+    std::thread prof_thread([&]{
+        int stable_ok=0, stable_bad=0;
+        while (run_prof.load()) {
             profiler.send_probes();
             profiler.receive_replies_epoll(150);
             auto stats = profiler.get_stats();
             udp_sender.set_profiles(stats);
             g_last_stats = stats;
 
-            // redundancy’yi loss’a göre ayarla
-            double loss_sum = 0.0;
-            for (const auto& s : stats) loss_sum += s.packet_loss;
-            double avg_loss = stats.empty() ? 0.0 : loss_sum / stats.size();
+            double loss_sum=0.0, rtt_sum=0.0;
+            for (auto& s: stats){ loss_sum+=s.packet_loss; rtt_sum+=s.avg_rtt_ms; }
+            double avg_loss = stats.empty()?0.0:loss_sum/stats.size();
+            (void)rtt_sum;
 
-            int new_redundancy = 1;
-            if (avg_loss > 0.10) new_redundancy = 4;
-            else if (avg_loss > 0.05) new_redundancy = 3;
-            else new_redundancy = 2;
+            // clone sayısını loss'a göre
+            int new_red = 2;
+            if (avg_loss > 0.10) new_red = 3;
+            if (avg_loss > 0.20) new_red = 4;
+            udp_sender.enable_redundancy(std::min(new_red, (int)receiver_ports.size()));
 
-            udp_sender.enable_redundancy(new_redundancy);
+            // Dinamik MTU: kötüleşmede hızlı küçült, düzelmede yavaş büyüt
+            size_t cur = g_mtu_bytes.load(), tgt = cur;
+            if (avg_loss >= 0.12) { stable_bad++; stable_ok=0; }
+            else if (avg_loss <= 0.02) { stable_ok++; stable_bad=0; }
+            else { stable_ok=stable_bad=0; }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+            if (stable_bad >= 1) {
+                if      (cur > 800) tgt = 800;
+                else if (cur > 600) tgt = 600;
+                else if (cur > 480) tgt = 480;
+                stable_bad = 0;
+            }
+            if (stable_ok >= 3) {
+                if      (cur < 600) tgt = 600;
+                else if (cur < 800) tgt = 800;
+                else if (cur < 1000) tgt = 1000;
+                stable_ok = 0;
+            }
+            if (tgt != cur) {
+                g_mtu_bytes.store(tgt);
+                std::cout << "[ABR] avg_loss=" << avg_loss << " -> MTU " << cur << " => " << tgt << "\n";
+            }
+
+            // pacing güncelle
+            udp_sender.set_total_rate_bps(target_bitrate.load());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         }
     });
 
-    // Kamera
-    cap.open(Device_ID, cv::CAP_V4L2);
-    if (!cap.isOpened()) { cout << "Error opening video device" << endl; return -1; }
+    // === Kamera / Encoder ===
+    Mat frame; VideoCapture cap;
+    cap.open(DEVICE_ID, cv::CAP_V4L2);
+    if (!cap.isOpened()) { std::cerr<<"camera open failed\n"; return -1; }
     cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('M','J','P','G'));
     cap.set(CAP_PROP_FRAME_WIDTH, WIDTH);
     cap.set(CAP_PROP_FRAME_HEIGHT, HEIGHT);
     cap.set(CAP_PROP_FPS, FPS);
 
-    // Encoder
     const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!codec){ cout << "Codec not found" << endl; return -1; }
+    if (!codec) { std::cerr<<"Codec not found\n"; return -1; }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
-    int current_bitrate = bitrate;
-    ctx->bit_rate = current_bitrate;
-    ctx->width = WIDTH; ctx->height = HEIGHT;
-    ctx->time_base = AVRational{1, FPS};
-    ctx->framerate = AVRational{FPS, 1};
-    ctx->gop_size = 7; ctx->max_b_frames = 0;
-    ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP;
+    ctx->bit_rate = bitrate; ctx->width=WIDTH; ctx->height=HEIGHT;
+    ctx->time_base = AVRational{1, FPS}; ctx->framerate = AVRational{FPS,1};
+    ctx->gop_size = 7; ctx->max_b_frames = 0; ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP;
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    ctx->rc_buffer_size = current_bitrate * 2;
-    ctx->rc_max_rate    = current_bitrate * 2;
-    ctx->rc_min_rate    = std::max(current_bitrate / 2, 400000);
-    unsigned hw_threads = std::max(2u, std::thread::hardware_concurrency());
-    ctx->thread_count = std::min<unsigned>(16, hw_threads);
-    ctx->thread_type = FF_THREAD_FRAME;
+    ctx->rc_buffer_size = bitrate*2; ctx->rc_max_rate = bitrate*2; ctx->rc_min_rate = std::max(bitrate/2, 400000);
+    unsigned hw = std::max(2u, std::thread::hardware_concurrency());
+    ctx->thread_count = std::min<unsigned>(16, hw); ctx->thread_type = FF_THREAD_FRAME;
 
     av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
     av_opt_set(ctx->priv_data, "tune",   "zerolatency", 0);
@@ -335,112 +263,80 @@ int main(int argc, char** argv){
     av_opt_set(ctx->priv_data, "scenecut", "0", 0);
     av_opt_set(ctx->priv_data, "nal-hrd", "cbr", 0);
 
-    if (avcodec_open2(ctx, codec, nullptr) < 0){ cerr<<"Error opening codec"<<endl; return -2; }
+    if (avcodec_open2(ctx, codec, nullptr) < 0) { std::cerr<<"encoder open failed\n"; return -2; }
 
     AVFrame* yuv = av_frame_alloc();
-    yuv->format = ctx->pix_fmt; yuv->width  = ctx->width; yuv->height = ctx->height;
+    yuv->format = ctx->pix_fmt; yuv->width=ctx->width; yuv->height=ctx->height;
     av_image_alloc(yuv->data, yuv->linesize, WIDTH, HEIGHT, ctx->pix_fmt, 1);
 
     AVPacket* pkt = av_packet_alloc();
-    AVPacket* pkt_filtered = av_packet_alloc();
+    AVPacket* pkt_f = av_packet_alloc();
 
-    SwsContext* sws = sws_getContext(
-        WIDTH, HEIGHT, AV_PIX_FMT_BGR24,
-        WIDTH, HEIGHT, AV_PIX_FMT_YUV420P,
-        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
-    );
+    SwsContext* sws = sws_getContext(WIDTH, HEIGHT, AV_PIX_FMT_BGR24, WIDTH, HEIGHT, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 
-    int frame_count = 0;
-    uint32_t tx_unit_id = 0; // her encoder çıktısı için benzersiz ID
-    int fps_counter = 0;
-    auto t0 = chrono::high_resolution_clock::now();
-
-    // Annex B garantisi
-    const AVBitStreamFilter* bsf_filter = av_bsf_get_by_name("h264_mp4toannexb");
+    const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
     AVBSFContext* bsf_ctx = nullptr;
-    if (bsf_filter) {
-        av_bsf_alloc(bsf_filter, &bsf_ctx);
+    if (bsf) {
+        av_bsf_alloc(bsf, &bsf_ctx);
         avcodec_parameters_from_context(bsf_ctx->par_in, ctx);
         bsf_ctx->time_base_in = ctx->time_base;
-        if (av_bsf_init(bsf_ctx) < 0) {
-            std::cerr << "Failed to init h264_mp4toannexb bitstream filter" << std::endl;
-            av_bsf_free(&bsf_ctx); bsf_ctx = nullptr;
-        }
+        if (av_bsf_init(bsf_ctx) < 0) { av_bsf_free(&bsf_ctx); bsf_ctx=nullptr; }
     }
 
-    while(cap.read(frame)){
-        fps_counter++;
-        frame_count++;
+    int frame_cnt=0,fps_cnt=0; auto t0=chrono::high_resolution_clock::now();
+    while (cap.read(frame)) {
+        fps_cnt++; frame_cnt++;
         auto t1 = chrono::high_resolution_clock::now();
         if (chrono::duration_cast<chrono::seconds>(t1 - t0).count() >= 1) {
-            cout << "Measured FPS: " << fps_counter << endl;
-            fps_counter = 0; t0 = t1;
+            std::cout << "Measured FPS: " << fps_cnt << "\n"; fps_cnt=0; t0=t1;
         }
 
-        // BGR -> YUV420P
-        const uint8_t* src_slice[] = {frame.data};
-        int src_stride[] = {static_cast<int>(frame.step)};
-        sws_scale(sws, src_slice, src_stride, 0, HEIGHT, yuv->data, yuv->linesize);
-        yuv->pts = frame_count;
+        const uint8_t* src[] = { frame.data };
+        int stride[] = { (int)frame.step };
+        sws_scale(sws, src, stride, 0, HEIGHT, yuv->data, yuv->linesize);
+        yuv->pts = frame_cnt;
 
         avcodec_send_frame(ctx, yuv);
-
         while (avcodec_receive_packet(ctx, pkt) == 0) {
             bool is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
-            if (is_key) {
-                // keyframe'lerde clone sayısını biraz yükselt
-                udp_sender.enable_redundancy(std::min<int>(4, std::max<int>(3, (int)receiver_ports.size()/2)));
-            }
+            if (is_key) udp_sender.enable_redundancy(std::min<int>(4, std::max<int>(2,(int)receiver_ports.size()/2)));
 
             const uint8_t* send_data = pkt->data;
             size_t send_size = (size_t)pkt->size;
 
             if (bsf_ctx) {
                 if (av_bsf_send_packet(bsf_ctx, pkt) == 0) {
-                    while (av_bsf_receive_packet(bsf_ctx, pkt_filtered) == 0) {
-                        send_data = pkt_filtered->data;
-                        send_size = (size_t)pkt_filtered->size;
-                        is_key = (pkt_filtered->flags & AV_PKT_FLAG_KEY) != 0;
+                    while (av_bsf_receive_packet(bsf_ctx, pkt_f) == 0) {
+                        send_data = pkt_f->data; send_size = (size_t)pkt_f->size;
+                        is_key = (pkt_f->flags & AV_PKT_FLAG_KEY) != 0;
 
-                        BuiltSlices built = build_slices_with_fec(send_data, send_size, mtu, tx_unit_id++, is_key);
+                        auto built = build_slices_with_fec(send_data, send_size, g_mtu_bytes.load(), (uint32_t)frame_cnt, is_key);
                         if (!built.data_slices.empty())   udp_sender.send_slices_parallel(built.data_slices);
                         if (!built.parity_slices.empty()) udp_sender.send_slices_parallel(built.parity_slices);
-
-                        av_packet_unref(pkt_filtered);
+                        av_packet_unref(pkt_f);
                     }
                 }
             } else {
-                BuiltSlices built = build_slices_with_fec(send_data, send_size, mtu, tx_unit_id++, is_key);
+                auto built = build_slices_with_fec(send_data, send_size, g_mtu_bytes.load(), (uint32_t)frame_cnt, is_key);
                 if (!built.data_slices.empty())   udp_sender.send_slices_parallel(built.data_slices);
                 if (!built.parity_slices.empty()) udp_sender.send_slices_parallel(built.parity_slices);
             }
-
             av_packet_unref(pkt);
         }
 
         imshow("Video", frame);
-        if(waitKey(5) >= 0 ){ break; }
+        if (waitKey(1) >= 0) break;
     }
 
-    av_frame_free(&yuv);
-    av_packet_free(&pkt);
-    av_packet_free(&pkt_filtered);
     if (bsf_ctx) av_bsf_free(&bsf_ctx);
     sws_freeContext(sws);
+    av_frame_free(&yuv);
+    av_packet_free(&pkt);
+    av_packet_free(&pkt_f);
     avcodec_free_context(&ctx);
-    cap.release();
-    destroyAllWindows();
+    cap.release(); destroyAllWindows();
 
-    // stop profiler thread
-    run_profiler.store(false);
-    run_sender.store(false);
-    // sender thread’i unblock et
-    struct Packet { std::vector<uint8_t> data; };
-    // zaten üstte aynı struct tanımlı; burada sadece unblock için boş push etmiştik
-    // packet_q.push(Packet{}); // eğer queue’yu hiç kullanmıyorsan yoruma alabilirsin
-
-    if (sender_thread.joinable()) sender_thread.join();
-    if (profiler_thread.joinable()) profiler_thread.join();
-
+    run_prof.store(false);
+    if (prof_thread.joinable()) prof_thread.join();
     return 0;
 }

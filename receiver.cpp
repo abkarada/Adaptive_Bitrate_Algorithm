@@ -10,14 +10,14 @@
 #include <set>
 #include <deque>
 #include <condition_variable>
-#include <pthread.h>
-#include <sched.h>
-#include <array>   // <-- eklendi
+#include <array>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
@@ -31,275 +31,202 @@ extern "C" {
 }
 
 #include <isa-l/erasure_code.h>
-
-#include "udp_port_profiler.h" // for UdpProbe struct (echo)
+#include "udp_port_profiler.h"
 
 using namespace std;
 
-// Mirror of sender's header
+// --- slice header (sender ile aynı) ---
 #pragma pack(push, 1)
 struct SliceHeader {
-    uint32_t magic;            // 0xABCD1234
-    uint32_t frame_id;         // increasing
-    uint16_t slice_index;      // [0..total_slices-1]
-    uint16_t total_slices;     // k + r
-    uint16_t k_data;           // k
-    uint16_t r_parity;         // r
-    uint16_t payload_bytes;    // payload size used by encoder
-    uint32_t total_frame_bytes;// original encoded size
-    uint64_t timestamp_us;     // sender ts
-    uint8_t  flags;            // bit0 parity
-    uint32_t checksum;         // FNV-1a over payload
+    uint32_t magic;
+    uint32_t frame_id;
+    uint16_t slice_index;
+    uint16_t total_slices;
+    uint16_t k_data;
+    uint16_t r_parity;
+    uint16_t payload_bytes;
+    uint32_t total_frame_bytes;
+    uint64_t timestamp_us;
+    uint8_t  flags;
+    uint32_t checksum;
 };
 #pragma pack(pop)
 
 static constexpr uint32_t SLICE_MAGIC = 0xABCD1234u;
-static constexpr uint16_t CTRL_NACK_PORT = 49000; // (şimdilik kullanılmıyor)
 
 struct FrameBuffer {
     uint32_t frame_id = 0;
     uint16_t k = 0, r = 0, m = 0;
-    uint16_t payload_size = 0; // MTU - header
+    uint16_t payload_size = 0;
     uint32_t total_frame_bytes = 0;
-    std::vector<std::vector<uint8_t>> data_blocks;   // k
-    std::vector<std::vector<uint8_t>> parity_blocks; // r
-    std::vector<uint8_t> data_present;   // k flags
-    std::vector<uint8_t> parity_present; // r flags
+    std::vector<std::vector<uint8_t>> data_blocks;
+    std::vector<std::vector<uint8_t>> parity_blocks;
+    std::vector<uint8_t> data_present;
+    std::vector<uint8_t> parity_present;
     std::chrono::steady_clock::time_point first_seen;
-    std::set<std::pair<uint16_t, uint16_t>> received_packets; // (slice_index, port) dedup takibi
 };
 
-static inline uint64_t now_us() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-               std::chrono::high_resolution_clock::now().time_since_epoch())
-        .count();
-}
-
-// Attempt to assemble a complete encoded frame into out_bytes
 static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_bytes) {
-    const int k = fb.k;
-    const int r = fb.r;
-    const int m = fb.m;
-    const int len = fb.payload_size;
+    const int k = fb.k, r = fb.r, m = fb.m, len = fb.payload_size;
 
-    int have_data = 0;
-    for (int i = 0; i < k; ++i) have_data += fb.data_present[i] ? 1 : 0;
+    int have_data = 0; for (int i=0;i<k;++i) have_data += fb.data_present[i]?1:0;
     if (have_data == k) {
-        // Fast path: direct concat of data blocks
         out_bytes.resize(fb.total_frame_bytes);
         size_t off = 0;
-        for (int i = 0; i < k; ++i) {
+        for (int i=0;i<k;++i) {
             size_t to_copy = std::min<size_t>(len, fb.total_frame_bytes - off);
-            if (to_copy == 0) break;
-            std::memcpy(out_bytes.data() + off, fb.data_blocks[i].data(), to_copy);
+            if (!to_copy) break;
+            std::memcpy(out_bytes.data()+off, fb.data_blocks[i].data(), to_copy);
             off += to_copy;
         }
         return true;
     }
-
-    // Need to recover missing data blocks using parity if possible
-    int present_total = have_data;
-    for (int i = 0; i < r; ++i) present_total += fb.parity_present[i] ? 1 : 0;
+    int present_total = have_data; for (int i=0;i<r;++i) present_total += fb.parity_present[i]?1:0;
     int missing_data = k - have_data;
-    if (present_total < k || missing_data > r) return false; // not enough to recover
+    if (present_total < k || missing_data > r) return false;
 
-    // Build encode matrix A (m x k)
-    std::vector<uint8_t> a(static_cast<size_t>(m) * static_cast<size_t>(k));
-    gf_gen_rs_matrix(a.data(), m, k);
+    std::vector<uint8_t> A((size_t)m*(size_t)k); gf_gen_rs_matrix(A.data(), m, k);
+    std::vector<uint8_t> frag_err; frag_err.reserve(k);
+    for (int i=0;i<k;++i) if (!fb.data_present[i]) frag_err.push_back((uint8_t)i);
+    int nerrs = (int)frag_err.size(); if (nerrs==0) return false;
 
-    // Build error list for missing data fragments only (indices among 0..k-1)
-    std::vector<uint8_t> frag_err_list;
-    frag_err_list.reserve(k);
-    for (int i = 0; i < k; ++i) if (!fb.data_present[i]) frag_err_list.push_back(static_cast<uint8_t>(i));
-    int nerrs = static_cast<int>(frag_err_list.size());
-    if (nerrs == 0) return false; // shouldn't reach here, fast path handled earlier
+    std::vector<uint8_t> survive; survive.reserve(k);
+    for (int i=0;i<k && (int)survive.size()<k; ++i) if (fb.data_present[i]) survive.push_back((uint8_t)i);
+    for (int i=0;i<r && (int)survive.size()<k; ++i) if (fb.parity_present[i]) survive.push_back((uint8_t)(k+i));
+    if ((int)survive.size() < k) return false;
 
-    // Choose k surviving fragment indices from actually present blocks
-    std::vector<uint8_t> survive_indices;
-    survive_indices.reserve(k);
-    for (int i = 0; i < k && (int)survive_indices.size() < k; ++i)
-        if (fb.data_present[i]) survive_indices.push_back(static_cast<uint8_t>(i));
-    for (int i = 0; i < r && (int)survive_indices.size() < k; ++i)
-        if (fb.parity_present[i]) survive_indices.push_back(static_cast<uint8_t>(k + i));
-    if ((int)survive_indices.size() < k) return false;
-
-    // Construct temp_matrix from survive_indices rows (B)
-    std::vector<uint8_t> temp_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
-    for (int row = 0; row < k; ++row) {
-        uint8_t idx = survive_indices[row];
-        for (int col = 0; col < k; ++col)
-            temp_matrix[k * row + col] = a[k * idx + col];
+    std::vector<uint8_t> B((size_t)k*(size_t)k);
+    for (int row=0; row<k; ++row) {
+        uint8_t idx = survive[row];
+        for (int col=0; col<k; ++col) B[(size_t)k*row+col] = A[(size_t)k*idx+col];
     }
-    // Invert B
-    std::vector<uint8_t> invert_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
-    if (gf_invert_matrix(temp_matrix.data(), invert_matrix.data(), k) < 0) return false;
+    std::vector<uint8_t> Binv((size_t)k*(size_t)k);
+    if (gf_invert_matrix(B.data(), Binv.data(), k) < 0) return false;
 
-    // Build decode matrix rows for missing data
-    std::vector<uint8_t> decode_matrix(static_cast<size_t>(k) * static_cast<size_t>(nerrs));
-    for (int e = 0; e < nerrs; ++e) {
-        int err_idx = frag_err_list[e];
-        for (int j = 0; j < k; ++j)
-            decode_matrix[k * e + j] = invert_matrix[k * err_idx + j];
+    std::vector<uint8_t> D((size_t)k*(size_t)nerrs);
+    for (int e=0; e<nerrs; ++e) {
+        int err_idx = frag_err[e];
+        for (int j=0;j<k;++j) D[(size_t)k*e + j] = Binv[(size_t)k*err_idx + j];
     }
 
-    // Prepare recover_srcs pointers from actually present fragments in survive_indices
-    std::vector<uint8_t*> recover_srcs(static_cast<size_t>(k), nullptr);
-    for (int row = 0; row < k; ++row) {
-        uint8_t idx = survive_indices[row];
-        if (idx < k) recover_srcs[row] = fb.data_blocks[idx].data();
-        else         recover_srcs[row] = fb.parity_blocks[idx - k].data();
+    std::vector<uint8_t*> srcs((size_t)k,nullptr);
+    for (int row=0; row<k; ++row) {
+        uint8_t idx = survive[row];
+        srcs[row] = (idx < k) ? fb.data_blocks[idx].data() : fb.parity_blocks[idx-k].data();
     }
-    // Output buffers for recovered data blocks
-    std::vector<std::vector<uint8_t>> recover_out(static_cast<size_t>(nerrs), std::vector<uint8_t>(len));
-    std::vector<uint8_t*> recover_outp(static_cast<size_t>(nerrs));
-    for (int i = 0; i < nerrs; ++i) recover_outp[(size_t)i] = recover_out[(size_t)i].data();
 
-    // Initialize g_tbls and recover
-    std::vector<uint8_t> g_tbls(static_cast<size_t>(k) * static_cast<size_t>(nerrs) * 32);
-    ec_init_tables(k, nerrs, decode_matrix.data(), g_tbls.data());
-    ec_encode_data(len, k, nerrs, g_tbls.data(), recover_srcs.data(), recover_outp.data());
+    std::vector<std::vector<uint8_t>> out((size_t)nerrs, std::vector<uint8_t>(len));
+    std::vector<uint8_t*> outp((size_t)nerrs);
+    for (int i=0;i<nerrs;++i) outp[i] = out[i].data();
 
-    // Place recovered data blocks back to their indices
-    for (int i = 0; i < nerrs; ++i) {
-        int idx = frag_err_list[(size_t)i];
-        fb.data_blocks[(size_t)idx]  = std::move(recover_out[(size_t)i]);
+    std::vector<uint8_t> g_tbls((size_t)k*(size_t)nerrs*32);
+    ec_init_tables(k, nerrs, D.data(), g_tbls.data());
+    ec_encode_data(len, k, nerrs, g_tbls.data(), srcs.data(), outp.data());
+
+    for (int i=0;i<nerrs;++i) {
+        int idx = frag_err[i];
+        fb.data_blocks[(size_t)idx] = std::move(out[(size_t)i]);
         fb.data_present[(size_t)idx] = 1;
     }
-
-    // Now we should have all k data blocks
-    int have = 0; for (int i = 0; i < k; ++i) have += fb.data_present[i] ? 1 : 0;
+    int have = 0; for (int i=0;i<k;++i) have += fb.data_present[i]?1:0;
     if (have != k) return false;
 
     out_bytes.resize(fb.total_frame_bytes);
     size_t off = 0;
-    for (int i = 0; i < k; ++i) {
+    for (int i=0;i<k;++i) {
         size_t to_copy = std::min<size_t>(len, fb.total_frame_bytes - off);
-        if (to_copy == 0) break;
-        std::memcpy(out_bytes.data() + off, fb.data_blocks[i].data(), to_copy);
+        if (!to_copy) break;
+        std::memcpy(out_bytes.data()+off, fb.data_blocks[i].data(), to_copy);
         off += to_copy;
     }
     return true;
 }
 
 static std::vector<uint16_t> parse_ports_csv(const std::string& csv) {
-    std::vector<uint16_t> out;
-    std::stringstream ss(csv);
-    std::string item;
+    std::vector<uint16_t> out; std::stringstream ss(csv); std::string item;
     while (std::getline(ss, item, ',')) {
         if (item.empty()) continue;
         int v = std::stoi(item);
-        if (v > 0 && v < 65536) out.push_back(static_cast<uint16_t>(v));
+        if (v>0 && v<65536) out.push_back((uint16_t)v);
     }
     return out;
 }
 
 static void print_usage_receiver(const char* prog) {
-    std::cout << "Usage: " << prog << " [--ports <p1,p2,...> | --port <p>] [--mtu <bytes>]" << std::endl;
-    std::cout << "  examples:\n"
-              << "    " << prog << " --port 4000 --mtu 1200\n"
-              << "    " << prog << " --ports 4000,4001,4002 --mtu 1200\n";
+    std::cout << "Usage: " << prog << " [--ports <p1,p2,...> | --port <p>] [--mtu <bytes>]\n";
 }
 
 int main(int argc, char** argv) {
-    // 5 ports for 5x bandwidth multiplication!
-    std::vector<uint16_t> listen_ports = {4000, 4001, 4002, 4003, 4004};
-    size_t mtu = 1000; // Fixed size buffer - no fragmentation
+    std::vector<uint16_t> listen_ports = {4000,4001,4002,4003,4004};
+    size_t mtu = 1000;
 
-    // CLI
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--ports" && i + 1 < argc) {
-            listen_ports = parse_ports_csv(argv[++i]);
-        } else if (arg == "--port" && i + 1 < argc) {
-            int p = std::stoi(argv[++i]);
-            if (p > 0 && p < 65536) listen_ports = { static_cast<uint16_t>(p) };
-        } else if (arg == "--mtu" && i + 1 < argc) {
-            int v = std::stoi(argv[++i]);
-            if (v > 200 && v <= 2000) mtu = static_cast<size_t>(v);
-        } else if (arg == "-h" || arg == "--help") {
-            print_usage_receiver(argv[0]);
-            return 0;
-        }
-    }
-    if (listen_ports.empty()) {
-        std::cerr << "No listen ports specified.\n";
-        print_usage_receiver(argv[0]);
-        return 1;
+    for (int i=1;i<argc;++i) {
+        std::string a = argv[i];
+        if (a=="--ports" && i+1<argc) listen_ports = parse_ports_csv(argv[++i]);
+        else if (a=="--port" && i+1<argc) { int p=std::stoi(argv[++i]); if (p>0&&p<65536) listen_ports={ (uint16_t)p }; }
+        else if (a=="--mtu" && i+1<argc) { int v=std::stoi(argv[++i]); if (v>200 && v<=2000) mtu=(size_t)v; }
+        else if (a=="-h"||a=="--help") { print_usage_receiver(argv[0]); return 0; }
     }
 
     const size_t header_size = sizeof(SliceHeader);
-    const size_t payload_size_default = mtu > header_size ? (mtu - header_size) : 0;
+    const size_t payload_size_default = mtu>header_size ? (mtu-header_size) : 0;
 
-    // Sockets
-    std::vector<int> sockets;
-    sockets.reserve(listen_ports.size());
+    std::vector<int> sockets; sockets.reserve(listen_ports.size());
     for (uint16_t port : listen_ports) {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) { perror("socket"); continue; }
-        // Büyük receive buffer
-        int rcvbuf = 16 * 1024 * 1024; // 16MB
+
+        // non-blocking
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int rcvbuf = 16 * 1024 * 1024;
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
-        if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(fd); continue; }
+
+        sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=INADDR_ANY; addr.sin_port=htons(port);
+        if (bind(fd, (sockaddr*)&addr, sizeof(addr))<0) { perror("bind"); close(fd); continue; }
         sockets.push_back(fd);
-        std::cout << "Listening UDP port " << port << std::endl;
+        std::cout << "Listening UDP port " << port << "\n";
     }
-    if (sockets.empty()) { std::cerr << "No sockets bound" << std::endl; return 1; }
+    if (sockets.empty()) { std::cerr << "No sockets bound\n"; return 1; }
 
-    // (Şimdilik kullanılmıyor) NACK socket
-    int nack_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (nack_sock < 0) { perror("socket"); return 1; }
-    sockaddr_in nack_addr{}; nack_addr.sin_family = AF_INET; nack_addr.sin_port = htons(CTRL_NACK_PORT); nack_addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(nack_sock, (sockaddr*)&nack_addr, sizeof(nack_addr)) < 0) { perror("bind"); close(nack_sock); return 1; }
-    std::cout << "Listening NACK port " << CTRL_NACK_PORT << std::endl;
-
-    // epoll
     int epfd = epoll_create1(0);
-    if (epfd < 0) { perror("epoll_create1"); return 1; }
+    if (epfd<0) { perror("epoll_create1"); return 1; }
     for (int fd : sockets) {
-        epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = fd;
+        epoll_event ev{}; ev.events=EPOLLIN; ev.data.fd=fd;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) perror("epoll_ctl");
     }
 
-    // FFmpeg decoder
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!codec) { std::cerr << "H264 decoder not found" << std::endl; return 2; }
+    if (!codec) { std::cerr<<"H264 decoder not found\n"; return 2; }
     AVCodecContext* dctx = avcodec_alloc_context3(codec);
-    if (avcodec_open2(dctx, codec, nullptr) < 0) { std::cerr << "decoder open failed" << std::endl; return 2; }
+    if (avcodec_open2(dctx, codec, nullptr) < 0) { std::cerr<<"decoder open failed\n"; return 2; }
     AVFrame* frm = av_frame_alloc();
     AVPacket* pkt = av_packet_alloc();
-    SwsContext* sws = nullptr;
 
-    // Simple decode-display worker queue
     struct ImgTask { int w; int h; int fmt; std::array<uint8_t*,4> data; std::array<int,4> linesize; };
     std::mutex q_mtx; std::condition_variable q_cv; std::deque<ImgTask> img_q;
     std::atomic<bool> run_workers{true};
     unsigned hw = std::max(2u, std::thread::hardware_concurrency());
     unsigned worker_threads = std::min<unsigned>(16, std::max<unsigned>(6, hw));
-    std::vector<std::thread> workers;
-    workers.reserve(worker_threads);
-    for (unsigned t=0; t<worker_threads; ++t) {
-        workers.emplace_back([&, t]{
-            // pin worker to a core
-            cpu_set_t cpuset; CPU_ZERO(&cpuset); CPU_SET((t+1)%std::max(2u, std::thread::hardware_concurrency()), &cpuset);
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    std::vector<std::thread> workers; workers.reserve(worker_threads);
+    for (unsigned t=0;t<worker_threads;++t) {
+        workers.emplace_back([&,t]{
             while (run_workers.load()) {
                 ImgTask task{};
                 {
                     std::unique_lock<std::mutex> lk(q_mtx);
-                    q_cv.wait(lk, [&]{ return !img_q.empty() || !run_workers.load(); });
+                    q_cv.wait(lk,[&]{ return !img_q.empty() || !run_workers.load(); });
                     if (!run_workers.load()) break;
-                    task = std::move(img_q.front());
-                    img_q.pop_front();
+                    task = std::move(img_q.front()); img_q.pop_front();
                 }
-                // Convert and display
                 SwsContext* lsws = sws_getContext(task.w, task.h, (AVPixelFormat)task.fmt,
                                                   task.w, task.h, AV_PIX_FMT_BGR24,
                                                   SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
                 if (!lsws) continue;
                 cv::Mat img(task.h, task.w, CV_8UC3);
                 uint8_t* dst[] = { img.data, nullptr, nullptr, nullptr };
-                int dstStride[] = { static_cast<int>(img.step[0]), 0, 0, 0 };
+                int dstStride[] = { (int)img.step[0], 0, 0, 0 };
                 sws_scale(lsws, task.data.data(), task.linesize.data(), 0, task.h, dst, dstStride);
                 sws_freeContext(lsws);
                 cv::imshow("NovaEngine Receiver", img);
@@ -315,120 +242,103 @@ int main(int argc, char** argv) {
 
     cv::namedWindow("NovaEngine Receiver", cv::WINDOW_AUTOSIZE);
 
-    size_t rxbuf_capacity = std::max<size_t>(mtu, 4096);
-    std::vector<uint8_t> rxbuf(rxbuf_capacity);
-    epoll_event events[32];
+    std::vector<uint8_t> rxbuf(std::max<size_t>(mtu, 4096));
+    epoll_event events[64];
+
+    const size_t MAX_LIVE_FRAMES = 6;
 
     while (true) {
-        int nfds = epoll_wait(epfd, events, 32, std::max(5, buffer_ms / 3));
-        for (int i = 0; i < nfds; ++i) {
+        int nfds = epoll_wait(epfd, events, 64, std::max(5, buffer_ms / 3));
+        for (int i=0;i<nfds;++i) {
             int fd = events[i].data.fd;
-            sockaddr_in from{}; socklen_t fromlen = sizeof(from);
-            ssize_t n = recvfrom(fd, rxbuf.data(), rxbuf.size(), 0, (sockaddr*)&from, &fromlen);
-            if (n <= 0) continue;
-
-            // Probe echo support
-            if (n == (ssize_t)sizeof(UdpProbe)) {
-                UdpProbe pr{}; std::memcpy(&pr, rxbuf.data(), sizeof(pr));
-                if (pr.validate()) {
-                    sendto(fd, &pr, sizeof(pr), 0, (sockaddr*)&from, fromlen);
-                    continue;
+            for (;;) {
+                sockaddr_in from{}; socklen_t fromlen = sizeof(from);
+                ssize_t n = recvfrom(fd, rxbuf.data(), rxbuf.size(), 0, (sockaddr*)&from, &fromlen);
+                if (n < 0) {
+                    if (errno==EAGAIN || errno==EWOULDBLOCK) break; // bu fd boşaldı
+                    else break;
                 }
-            }
-
-            if (n < (ssize_t)sizeof(SliceHeader)) continue;
-            SliceHeader sh{}; std::memcpy(&sh, rxbuf.data(), sizeof(SliceHeader));
-            if (sh.magic != SLICE_MAGIC) continue;
-            const size_t recv_payload = (size_t)n - sizeof(SliceHeader);
-
-            // Initialize frame buffer if first time
-            auto& fb = frames[sh.frame_id];
-            if (fb.k == 0) {
-                fb.frame_id = sh.frame_id;
-                fb.k = sh.k_data; fb.r = sh.r_parity; fb.m = sh.total_slices;
-                size_t alloc_payload = sh.payload_bytes ? sh.payload_bytes : payload_size_default;
-                fb.payload_size = (uint16_t)alloc_payload;
-                fb.total_frame_bytes = sh.total_frame_bytes;
-                fb.data_blocks.assign(fb.k, std::vector<uint8_t>(fb.payload_size));
-                fb.parity_blocks.assign(fb.r, std::vector<uint8_t>(fb.payload_size));
-                fb.data_present.assign(fb.k, 0);
-                fb.parity_present.assign(fb.r, 0);
-                fb.first_seen = std::chrono::steady_clock::now();
-            }
-
-            // Dedup: bu slice zaten varsa atla
-            if ((sh.slice_index < fb.k && fb.data_present[sh.slice_index]) ||
-                (sh.slice_index >= fb.k && (sh.slice_index - fb.k) < fb.r &&
-                 fb.parity_present[sh.slice_index - fb.k])) {
-                continue;
-            }
-
-            const uint8_t* payload = rxbuf.data() + sizeof(SliceHeader);
-            if (sh.slice_index < fb.k) {
-                size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
-                std::memcpy(fb.data_blocks[sh.slice_index].data(), payload, copy_len);
-                // checksum validation
-                uint32_t h = 2166136261u;
-                for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.data_blocks[sh.slice_index][i]; h *= 16777619u; }
-                if (h == sh.checksum) {
-                    fb.data_present[sh.slice_index] = 1;
-                    fb.received_packets.insert({sh.slice_index, ntohs(from.sin_port)});
+                if (n == (ssize_t)sizeof(UdpProbe)) {
+                    UdpProbe pr{}; std::memcpy(&pr, rxbuf.data(), sizeof(pr));
+                    if (pr.validate()) { sendto(fd, &pr, sizeof(pr), 0, (sockaddr*)&from, fromlen); continue; }
                 }
-            } else {
-                uint16_t pi = (uint16_t)(sh.slice_index - fb.k);
-                if (pi < fb.r) {
+                if (n < (ssize_t)sizeof(SliceHeader)) continue;
+
+                SliceHeader sh{}; std::memcpy(&sh, rxbuf.data(), sizeof(SliceHeader));
+                if (sh.magic != SLICE_MAGIC) continue;
+                const size_t recv_payload = (size_t)n - sizeof(SliceHeader);
+
+                auto& fb = frames[sh.frame_id];
+                if (fb.k == 0) {
+                    fb.frame_id = sh.frame_id; fb.k = sh.k_data; fb.r = sh.r_parity; fb.m = sh.total_slices;
+                    size_t alloc_payload = sh.payload_bytes ? sh.payload_bytes : payload_size_default;
+                    fb.payload_size = (uint16_t)alloc_payload;
+                    fb.total_frame_bytes = sh.total_frame_bytes;
+                    fb.data_blocks.assign(fb.k, std::vector<uint8_t>(fb.payload_size));
+                    fb.parity_blocks.assign(fb.r, std::vector<uint8_t>(fb.payload_size));
+                    fb.data_present.assign(fb.k, 0);
+                    fb.parity_present.assign(fb.r, 0);
+                    fb.first_seen = std::chrono::steady_clock::now();
+
+                    if (frames.size() > MAX_LIVE_FRAMES) {
+                        uint32_t oldest = UINT32_MAX;
+                        for (auto &kv : frames) oldest = std::min(oldest, kv.first);
+                        if (oldest != sh.frame_id) frames.erase(oldest);
+                    }
+                }
+
+                const uint8_t* payload = rxbuf.data() + sizeof(SliceHeader);
+                if (sh.slice_index < fb.k) {
                     size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
-                    std::memcpy(fb.parity_blocks[pi].data(), payload, copy_len);
+                    std::memcpy(fb.data_blocks[sh.slice_index].data(), payload, copy_len);
                     uint32_t h = 2166136261u;
-                    for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.parity_blocks[pi][i]; h *= 16777619u; }
-                    if (h == sh.checksum) {
-                        fb.parity_present[pi] = 1;
-                        fb.received_packets.insert({sh.slice_index, ntohs(from.sin_port)});
-                    }
-                }
-            }
-
-            // Try reconstruct
-            std::vector<uint8_t> complete;
-            if (try_reconstruct_frame(fb, complete)) {
-                av_packet_unref(pkt);
-                if (av_new_packet(pkt, (int)complete.size()) == 0) {
-                    std::memcpy(pkt->data, complete.data(), complete.size());
+                    for (size_t i2=0;i2<fb.payload_size;++i2){ h ^= fb.data_blocks[sh.slice_index][i2]; h *= 16777619u; }
+                    if (h == sh.checksum) fb.data_present[sh.slice_index] = 1;
                 } else {
-                    continue;
-                }
-                if (avcodec_send_packet(dctx, pkt) == 0) {
-                    while (avcodec_receive_frame(dctx, frm) == 0) {
-                        ImgTask task{}; task.w = frm->width; task.h = frm->height; task.fmt = frm->format;
-                        for (int p=0;p<4;++p){ task.data[p]=frm->data[p]; task.linesize[p]=frm->linesize[p]; }
-                        {
-                            std::lock_guard<std::mutex> lk(q_mtx);
-                            img_q.emplace_back(std::move(task));
-                        }
-                        q_cv.notify_one();
+                    uint16_t pi = (uint16_t)(sh.slice_index - fb.k);
+                    if (pi < fb.r) {
+                        size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
+                        std::memcpy(fb.parity_blocks[pi].data(), payload, copy_len);
+                        uint32_t h = 2166136261u;
+                        for (size_t i2=0;i2<fb.payload_size;++i2){ h ^= fb.parity_blocks[pi][i2]; h *= 16777619u; }
+                        if (h == sh.checksum) fb.parity_present[pi] = 1;
                     }
                 }
-                frames.erase(sh.frame_id);
-            }
-        }
 
-        // Cleanup old frames
+                std::vector<uint8_t> complete;
+                if (try_reconstruct_frame(fb, complete)) {
+                    av_packet_unref(pkt);
+                    if (av_new_packet(pkt, (int)complete.size()) == 0) {
+                        std::memcpy(pkt->data, complete.data(), complete.size());
+                    } else continue;
+
+                    if (avcodec_send_packet(dctx, pkt) == 0) {
+                        while (avcodec_receive_frame(dctx, frm) == 0) {
+                            ImgTask task{}; task.w=frm->width; task.h=frm->height; task.fmt=frm->format;
+                            for (int p=0;p<4;++p){ task.data[p]=frm->data[p]; task.linesize[p]=frm->linesize[p]; }
+                            {
+                                std::lock_guard<std::mutex> lk(q_mtx);
+                                img_q.emplace_back(std::move(task));
+                            }
+                            q_cv.notify_one();
+                        }
+                    }
+                    frames.erase(sh.frame_id);
+                }
+            } // drain for this fd
+        } // epoll events
+
+        // timeout temizliği
         auto now = std::chrono::steady_clock::now();
         for (auto it = frames.begin(); it != frames.end(); ) {
-            if (now - it->second.first_seen > frame_timeout) it = frames.erase(it); else ++it;
+            if (now - it->second.first_seen > frame_timeout) it = frames.erase(it);
+            else ++it;
         }
     }
 
-    // Cleanup
-    run_workers = false;
-    q_cv.notify_all();
+    run_workers = false; q_cv.notify_all();
     for (auto& th : workers) if (th.joinable()) th.join();
-    if (sws) sws_freeContext(sws);
-    av_frame_free(&frm);
-    av_packet_free(&pkt);
-    avcodec_free_context(&dctx);
-    for (int fd : sockets) close(fd);
-    close(epfd);
-    if (nack_sock >= 0) close(nack_sock);
+    av_frame_free(&frm); av_packet_free(&pkt); avcodec_free_context(&dctx);
+    for (int fd : sockets) close(fd); close(epfd);
     return 0;
 }

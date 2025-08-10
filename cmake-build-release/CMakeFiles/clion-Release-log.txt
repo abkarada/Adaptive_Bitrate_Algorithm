@@ -1,4 +1,0 @@
-/home/ryuzaki/Desktop/C++/clion-2024.3.4/bin/cmake/linux/x64/bin/cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM=/home/ryuzaki/Desktop/C++/clion-2024.3.4/bin/ninja/linux/x64/ninja -G Ninja -S /home/ryuzaki/Desktop/untitled -B /home/ryuzaki/Desktop/untitled/cmake-build-release
--- Configuring done (0.0s)
--- Generating done (0.0s)
--- Build files have been written to: /home/ryuzaki/Desktop/untitled/cmake-build-release
