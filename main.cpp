@@ -17,6 +17,9 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#include <pthread.h>   // <-- eklendi (CPU affinity için)
+#include <sched.h>     // <-- eklendi
+
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/highgui.hpp>
@@ -34,17 +37,13 @@ extern "C" {
 #include <libavcodec/bsf.h>
 }
 
-
 #define Device_ID 0
-
 #define WIDTH 640
 #define HEIGHT 480
 #define FPS 30
 
-
-// k ve r dinamik hesaplanacak, burada sabitler kullanılmıyor
-
-static size_t mtu = 1000; // Fixed size buffer - no fragmentation issues
+// MTU sabit: fragmentation önleme
+static size_t mtu = 1000;
 
 using namespace cv;
 using namespace std;
@@ -52,7 +51,7 @@ using namespace std;
 // Son profil istatistiklerini FEC r hesaplamasında kullanmak için global buffer
 std::vector<UDPChannelStat> g_last_stats;
 
-// Control channel for NACK (receiver -> sender)
+// (şu an kontrol kanalı kullanılmıyor ama header dursun)
 static constexpr uint16_t CTRL_NACK_PORT = 49000;
 #pragma pack(push, 1)
 struct NackPacket {
@@ -75,26 +74,11 @@ struct SliceHeader {
     uint16_t payload_bytes = 0; // payload size used for RS
     uint32_t total_frame_bytes = 0; // encoded size of this block
     uint64_t timestamp_us = 0;
-    uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe, bit2: critical_packet
+    uint8_t  flags = 0; // bit0: parity(1)/data(0), bit1: keyframe
     uint32_t checksum = 0; // FNV-1a over payload_bytes
 };
 #pragma pack(pop)
 static_assert(sizeof(SliceHeader) >= 1, "SliceHeader sanity");
-
-std::vector<std::vector<uint8_t>> slice_and_pad(const uint8_t* data, size_t size, size_t mtu) {
-    std::vector<std::vector<uint8_t>> chunks;
-    size_t offset = 0;
-
-    while (offset < size) {
-        size_t len = std::min(mtu, size - offset);
-        std::vector<uint8_t> chunk(mtu, 0); // always full MTU size
-        std::memcpy(chunk.data(), data + offset, len);
-        chunks.emplace_back(std::move(chunk));
-        offset += len;
-    }
-
-    return chunks;
-}
 
 struct BuiltSlices {
     std::vector<std::vector<uint8_t>> data_slices;
@@ -120,24 +104,19 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
 
     // Dinamik r belirleme: son profil metriklerine göre
     int r_parity = 1;
-    extern std::vector<UDPChannelStat> g_last_stats; // aşağıda güncellenecek
     double avg_loss = 0.0;
     if (!g_last_stats.empty()) {
         for (const auto& s : g_last_stats) avg_loss += s.packet_loss;
         avg_loss /= g_last_stats.size();
     }
-    // Balanced FEC for real network - not too aggressive
-    // Base 20% redundancy, scale with actual loss
-    double base_redundancy = 0.20; // 20% base redundancy
-    double loss_factor = avg_loss > 0.01 ? avg_loss : 0.01; // min 1% assumed loss
+    // Base 20% + loss'a göre artış, hard cap 50%
+    double base_redundancy = 0.20;
+    double loss_factor = avg_loss > 0.01 ? avg_loss : 0.01;
     double fec_ratio = std::min(0.5, base_redundancy + loss_factor * 1.5);
-    r_parity = std::clamp(static_cast<int>(std::ceil(k_data * fec_ratio)), 
-                         2, // min 2 parity blocks
-                         std::max(4, k_data / 2)); // max 50% redundancy
-    
-    // Moderate extra for keyframes
+    r_parity = std::clamp(static_cast<int>(std::ceil(k_data * fec_ratio)),
+                          2, std::max(4, k_data / 2));
     if (is_keyframe) {
-        r_parity = std::min(r_parity + 2, k_data * 2 / 3); // max 66% for keyframes
+        r_parity = std::min(r_parity + 2, k_data * 2 / 3);
     }
 
     out.k = k_data; out.r = r_parity;
@@ -162,8 +141,6 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
         hdr.total_frame_bytes = static_cast<uint32_t>(size);
         hdr.timestamp_us = now_us();
         hdr.flags = is_keyframe ? 0x02 : 0x00; // bit1: keyframe
-        // compute checksum over payload area we will fill
-        // first write header, then payload, then update checksum
         std::memcpy(out.data_slices[i].data(), &hdr, sizeof(SliceHeader));
 
         size_t remain = (src_off < size) ? (size - src_off) : 0;
@@ -216,8 +193,6 @@ BuiltSlices build_slices_with_fec(const uint8_t* data, size_t size, size_t mtu_b
     return out;
 }
 
-
-
 static std::vector<uint16_t> parse_ports_csv(const std::string& csv) {
     std::vector<uint16_t> out;
     std::stringstream ss(csv);
@@ -237,14 +212,13 @@ static void print_usage_sender(const char* prog) {
 int main(int argc, char** argv){
     Mat frame;
     VideoCapture cap;
-    int bitrate = 5000000; // 5 Mbps constant high bitrate - no changes!
+    int bitrate = 5'000'000; // 5 Mbps
     std::atomic<int> target_bitrate{bitrate};
-    int64_t counter = 0;
 
     std::string receiver_ip = "192.168.1.100"; // default target
-    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002, 4003, 4004}; // 5 ports = 5x bandwidth!
+    std::vector<uint16_t> receiver_ports = {4000, 4001, 4002, 4003, 4004};
 
-    // Parse CLI args
+    // CLI
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--ip" && i + 1 < argc) {
@@ -253,10 +227,9 @@ int main(int argc, char** argv){
             receiver_ports = parse_ports_csv(argv[++i]);
         } else if (arg == "--mtu" && i + 1 < argc) {
             int v = std::stoi(argv[++i]);
-            if (v > 200 && v <= 2000) mtu = static_cast<size_t>(v);
+            if (v > 200 && v <= 2000) mtu = (size_t)v;
         } else if (arg == "-h" || arg == "--help") {
-            print_usage_sender(argv[0]);
-            return 0;
+            print_usage_sender(argv[0]); return 0;
         }
     }
     if (receiver_ports.empty()) {
@@ -266,55 +239,14 @@ int main(int argc, char** argv){
     }
 
     AdaptiveUDPSender udp_sender(receiver_ip, receiver_ports);
-    
-    // ARQ cache for latest frame's data slices (for fast NACK responses)
-    struct ArqCacheEntry { uint32_t frame_id; std::unordered_map<uint16_t, std::vector<uint8_t>> data_slices; };
-    std::mutex arq_mtx;
-    ArqCacheEntry arq_cache{0, {}};
+    // toplam bitrate’i pacing’e bildir
+    udp_sender.set_total_rate_bps(target_bitrate.load());
 
-    // NACK responder thread
-    std::atomic<bool> run_nack{true};
-    std::thread nack_thread([&]{
-        // pin nack responder thread
-        cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(2, &cp);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(CTRL_NACK_PORT);
-        bind(sock, (sockaddr*)&addr, sizeof(addr));
-        while (run_nack.load()) {
-            NackPacket np{}; sockaddr_in from{}; socklen_t flen = sizeof(from);
-            ssize_t n = recvfrom(sock, &np, sizeof(np), 0, (sockaddr*)&from, &flen);
-            if (n != sizeof(NackPacket) || np.magic != 0x4E41434Bu) continue;
-            std::unordered_map<uint16_t, std::vector<uint8_t>> copy;
-            uint32_t fid;
-            {
-                std::lock_guard<std::mutex> lk(arq_mtx);
-                if (np.frame_id != arq_cache.frame_id) continue;
-                copy = arq_cache.data_slices;
-                fid = arq_cache.frame_id;
-            }
-            // resend requested slices directly to sender's normal data ports (primary port first)
-            for (uint16_t i = 0; i < np.missing_count; ++i) {
-                uint16_t idx = np.indices[i];
-                auto it = copy.find(idx);
-                if (it == copy.end()) continue;
-                std::vector<std::vector<uint8_t>> one{it->second};
-                udp_sender.send_slices(one);
-            }
-        }
-        close(sock);
-    });
+    // Redundancy başlangıcı (profilere göre aşağıda dinamik güncelleniyor)
+    udp_sender.enable_redundancy(4);
 
-    // Global paylaşımlı son profil istatistikleri
-    
-
-    // Clone packets to multiple tunnels for redundancy
-    udp_sender.enable_redundancy(2); // Send each packet through 2 different tunnels
-
-    // thread-safe queue for slice buffers
-    struct Packet {
-        std::vector<uint8_t> data;
-    };
+    // thread-safe queue (şu an aktif kullanılmıyor ama kalabilir)
+    struct Packet { std::vector<uint8_t> data; };
     class PacketQ {
         std::queue<Packet> q; std::mutex m; std::condition_variable cv;
     public:
@@ -322,10 +254,9 @@ int main(int argc, char** argv){
         bool pop(Packet &out){ std::unique_lock<std::mutex> lk(m); cv.wait(lk,[&]{return !q.empty();}); out = std::move(q.front()); q.pop(); return true; }
     } packet_q;
 
-    // live profiler thread to feed sender with channel stats
+    // sender thread (şu an kullanılmıyor; yine de bırakıyoruz)
     std::atomic<bool> run_sender{true};
     std::thread sender_thread([&](){
-        // pin sender thread
         cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(0, &cp);
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
         Packet pktv;
@@ -335,13 +266,13 @@ int main(int argc, char** argv){
             if(pktv.data.empty()) continue;
             std::vector<std::vector<uint8_t>> one{std::move(pktv.data)};
             udp_sender.send_slices(one);
-            // NO DELAYS - Maximum throughput!
         }
     });
+
+    // profiler
     UDPPortProfiler profiler(receiver_ip, receiver_ports);
     std::atomic<bool> run_profiler{true};
     std::thread profiler_thread([&](){
-        // pin profiler thread
         cpu_set_t cp; CPU_ZERO(&cp); CPU_SET(1, &cp);
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cp);
         while (run_profiler.load()) {
@@ -349,70 +280,49 @@ int main(int argc, char** argv){
             profiler.receive_replies_epoll(150);
             auto stats = profiler.get_stats();
             udp_sender.set_profiles(stats);
-            // Global istatistikleri güncelle
             g_last_stats = stats;
 
-            // Less aggressive bitrate adaptation - stabilized for smooth playback
+            // redundancy’yi loss’a göre ayarla
             double loss_sum = 0.0;
-            double rtt_sum = 0.0;
-            for (const auto& s : stats) { loss_sum += s.packet_loss; rtt_sum += s.avg_rtt_ms; }
+            for (const auto& s : stats) loss_sum += s.packet_loss;
             double avg_loss = stats.empty() ? 0.0 : loss_sum / stats.size();
-            double avg_rtt = stats.empty() ? 0.0 : rtt_sum / stats.size();
 
-            int cur = target_bitrate.load();
-            int new_bitrate = cur;
-
-            // NO BITRATE CHANGES! Keep it constant high
-            // Bitrate stays at 5Mbps no matter what
-            // Use multiple ports to handle network issues, not bitrate reduction
-            
-            // Dynamic redundancy based on loss (more clones for bad network)
             int new_redundancy = 1;
-            if (avg_loss > 0.10) new_redundancy = 3;      // 10%+ loss = 3 clones
-            else if (avg_loss > 0.05) new_redundancy = 2; // 5%+ loss = 2 clones
-            else new_redundancy = 1;                       // Good network = 1 copy
-            
+            if (avg_loss > 0.10) new_redundancy = 4;
+            else if (avg_loss > 0.05) new_redundancy = 3;
+            else new_redundancy = 2;
+
             udp_sender.enable_redundancy(new_redundancy);
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(3000)); // Update every 3 seconds - very sparse
+            std::this_thread::sleep_for(std::chrono::milliseconds(3000));
         }
     });
 
-
+    // Kamera
     cap.open(Device_ID, cv::CAP_V4L2);
-    if (!cap.isOpened()) {
-        cout << "Error opening video device" << endl;
-        return -1;
-    }
-    // Önce dört‐character code’u MJPG olarak ayarlayın
+    if (!cap.isOpened()) { cout << "Error opening video device" << endl; return -1; }
     cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('M','J','P','G'));
     cap.set(CAP_PROP_FRAME_WIDTH, WIDTH);
     cap.set(CAP_PROP_FRAME_HEIGHT, HEIGHT);
     cap.set(CAP_PROP_FPS, FPS);
 
+    // Encoder
     const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!codec)
-    {
-        cout << "Codec not found" << endl;
-        return -1;
-    }
+    if (!codec){ cout << "Codec not found" << endl; return -1; }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     int current_bitrate = bitrate;
     ctx->bit_rate = current_bitrate;
-    ctx->width = WIDTH;
-    ctx->height = HEIGHT;
+    ctx->width = WIDTH; ctx->height = HEIGHT;
     ctx->time_base = AVRational{1, FPS};
     ctx->framerate = AVRational{FPS, 1};
-    ctx->gop_size = 7; // çok kısa GOP (yaklaşık 7 frame'de bir IDR)
-    ctx->max_b_frames = 0;
-    ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP; // bağımsız GOP’lar
+    ctx->gop_size = 7; ctx->max_b_frames = 0;
+    ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP;
     ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->rc_buffer_size = current_bitrate * 2;
     ctx->rc_max_rate    = current_bitrate * 2;
     ctx->rc_min_rate    = std::max(current_bitrate / 2, 400000);
-    // Increase encoder threading
     unsigned hw_threads = std::max(2u, std::thread::hardware_concurrency());
-    ctx->thread_count = std::min<unsigned>(12, hw_threads); // cap to 12
+    ctx->thread_count = std::min<unsigned>(16, hw_threads);
     ctx->thread_type = FF_THREAD_FRAME;
 
     av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
@@ -420,40 +330,32 @@ int main(int argc, char** argv){
     av_opt_set_int(ctx->priv_data, "rc_lookahead", 0, 0);
     av_opt_set(ctx->priv_data, "repeat-headers", "1", 0);
     av_opt_set(ctx->priv_data, "profile", "baseline", 0);
-    // Stabil ve kısa GOP
     av_opt_set_int(ctx->priv_data, "keyint", 7, 0);
     av_opt_set_int(ctx->priv_data, "min-keyint", 7, 0);
     av_opt_set(ctx->priv_data, "scenecut", "0", 0);
     av_opt_set(ctx->priv_data, "nal-hrd", "cbr", 0);
 
-    int encoder_API = avcodec_open2(ctx, codec, nullptr);
-    if (encoder_API < 0)
-    {
-        cerr<<"Error opening codec"<<endl;
-        return -2;
-    }
+    if (avcodec_open2(ctx, codec, nullptr) < 0){ cerr<<"Error opening codec"<<endl; return -2; }
 
     AVFrame* yuv = av_frame_alloc();
-    yuv->format = ctx->pix_fmt;
-    yuv->width  = ctx->width;
-    yuv->height = ctx->height;
+    yuv->format = ctx->pix_fmt; yuv->width  = ctx->width; yuv->height = ctx->height;
     av_image_alloc(yuv->data, yuv->linesize, WIDTH, HEIGHT, ctx->pix_fmt, 1);
 
     AVPacket* pkt = av_packet_alloc();
     AVPacket* pkt_filtered = av_packet_alloc();
 
-    //OpenCV -->BGR input --Translation via SwsContext-->YUV420P -->AVFrame
     SwsContext* sws = sws_getContext(
         WIDTH, HEIGHT, AV_PIX_FMT_BGR24,
         WIDTH, HEIGHT, AV_PIX_FMT_YUV420P,
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
     );
+
     int frame_count = 0;
     uint32_t tx_unit_id = 0; // her encoder çıktısı için benzersiz ID
     int fps_counter = 0;
     auto t0 = chrono::high_resolution_clock::now();
 
-    // Initialize H.264 bitstream filter to ensure Annex B format
+    // Annex B garantisi
     const AVBitStreamFilter* bsf_filter = av_bsf_get_by_name("h264_mp4toannexb");
     AVBSFContext* bsf_ctx = nullptr;
     if (bsf_filter) {
@@ -462,118 +364,54 @@ int main(int argc, char** argv){
         bsf_ctx->time_base_in = ctx->time_base;
         if (av_bsf_init(bsf_ctx) < 0) {
             std::cerr << "Failed to init h264_mp4toannexb bitstream filter" << std::endl;
-            av_bsf_free(&bsf_ctx);
-            bsf_ctx = nullptr;
+            av_bsf_free(&bsf_ctx); bsf_ctx = nullptr;
         }
     }
 
     while(cap.read(frame)){
-        // NO BITRATE CHANGES - Keep constant 5Mbps
-        // Bitrate adjustment removed for stable quality
         fps_counter++;
         frame_count++;
-        std::vector<std::vector<uint8_t>> chunks;
         auto t1 = chrono::high_resolution_clock::now();
         if (chrono::duration_cast<chrono::seconds>(t1 - t0).count() >= 1) {
             cout << "Measured FPS: " << fps_counter << endl;
-            fps_counter = 0;
-            t0 = t1;
+            fps_counter = 0; t0 = t1;
         }
-        //cv::Mat (BGR) ----[sws_scale]---> AVFrame (YUV420P)
+
+        // BGR -> YUV420P
         const uint8_t* src_slice[] = {frame.data};
         int src_stride[] = {static_cast<int>(frame.step)};
         sws_scale(sws, src_slice, src_stride, 0, HEIGHT, yuv->data, yuv->linesize);
-
-        //Encoder a gönder
         yuv->pts = frame_count;
 
-        int raw_size = frame.total() * frame.elemSize(); // BGR frame boyutu (ham)
         avcodec_send_frame(ctx, yuv);
 
         while (avcodec_receive_packet(ctx, pkt) == 0) {
-            int encoded_size = pkt->size;
-
             bool is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
             if (is_key) {
-                // Anahtar karelerde FEC oranını arttırmak için global loss’a ek margin ver
-                // g_last_stats zaten r içinde dikkate alınıyor; burada opsiyonel olarak redundancy artırabiliriz
-                udp_sender.enable_redundancy( std::min<int>(3, std::max<int>(2, (int)receiver_ports.size()/2)) );
+                // keyframe'lerde clone sayısını biraz yükselt
+                udp_sender.enable_redundancy(std::min<int>(4, std::max<int>(3, (int)receiver_ports.size()/2)));
             }
+
             const uint8_t* send_data = pkt->data;
-            size_t send_size = static_cast<size_t>(pkt->size);
-            AVPacket* use_pkt = pkt;
+            size_t send_size = (size_t)pkt->size;
 
             if (bsf_ctx) {
-                // Run through bitstream filter to convert to Annex B
                 if (av_bsf_send_packet(bsf_ctx, pkt) == 0) {
                     while (av_bsf_receive_packet(bsf_ctx, pkt_filtered) == 0) {
                         send_data = pkt_filtered->data;
-                        send_size = static_cast<size_t>(pkt_filtered->size);
+                        send_size = (size_t)pkt_filtered->size;
                         is_key = (pkt_filtered->flags & AV_PKT_FLAG_KEY) != 0;
-                        BuiltSlices built = build_slices_with_fec(send_data,
-                                                                 send_size,
-                                                                 mtu,
-                                                                 tx_unit_id++,
-                                                                 is_key);
-                        // Update ARQ cache with only data slices
-                        {
-                            std::lock_guard<std::mutex> lk(arq_mtx);
-                            arq_cache.data_slices.clear();
-                            uint32_t fid = 0;
-                            for (auto& sl : built.data_slices) {
-                                if (sl.size() >= sizeof(SliceHeader)) {
-                                    SliceHeader sh{}; std::memcpy(&sh, sl.data(), sizeof(SliceHeader));
-                                    fid = sh.frame_id;
-                                    arq_cache.data_slices[sh.slice_index] = sl; // copy
-                                }
-                            }
-                            arq_cache.frame_id = fid;
-                        }
-                        cout << "Frame #" << frame_count
-                             << " | Raw: " << raw_size << " bytes"
-                             << " -> Encoded: " << encoded_size << " bytes"
-                             << " | k=" << built.k
-                             << " r=" << built.r
-                             << " | total=" << (built.k + built.r)
-                             << endl;
-                        // Scatter data slices deterministically; parity slices weighted
-                        if (!built.data_slices.empty()) {
-                            udp_sender.send_slices_parallel(built.data_slices);
-                        }
-                        if (!built.parity_slices.empty()) {
-                            udp_sender.send_slices_parallel(built.parity_slices);
-                        }
+
+                        BuiltSlices built = build_slices_with_fec(send_data, send_size, mtu, tx_unit_id++, is_key);
+                        if (!built.data_slices.empty())   udp_sender.send_slices_parallel(built.data_slices);
+                        if (!built.parity_slices.empty()) udp_sender.send_slices_parallel(built.parity_slices);
+
                         av_packet_unref(pkt_filtered);
                     }
                 }
             } else {
-                BuiltSlices built = build_slices_with_fec(send_data,
-                                                         send_size,
-                                                         mtu,
-                                                         tx_unit_id++,
-                                                         is_key);
-                // Update ARQ cache
-                {
-                    std::lock_guard<std::mutex> lk(arq_mtx);
-                    arq_cache.data_slices.clear();
-                    uint32_t fid = 0;
-                    for (auto& sl : built.data_slices) {
-                        if (sl.size() >= sizeof(SliceHeader)) {
-                            SliceHeader sh{}; std::memcpy(&sh, sl.data(), sizeof(SliceHeader));
-                            fid = sh.frame_id;
-                            arq_cache.data_slices[sh.slice_index] = sl;
-                        }
-                    }
-                    arq_cache.frame_id = fid;
-                }
-                cout << "Frame #" << frame_count
-                     << " | Raw: " << raw_size << " bytes"
-                     << " -> Encoded: " << encoded_size << " bytes"
-                     << " | k=" << built.k
-                     << " r=" << built.r
-                     << " | total=" << (built.k + built.r)
-                     << endl;
-                if (!built.data_slices.empty()) udp_sender.send_slices_parallel(built.data_slices);
+                BuiltSlices built = build_slices_with_fec(send_data, send_size, mtu, tx_unit_id++, is_key);
+                if (!built.data_slices.empty())   udp_sender.send_slices_parallel(built.data_slices);
                 if (!built.parity_slices.empty()) udp_sender.send_slices_parallel(built.parity_slices);
             }
 
@@ -581,9 +419,7 @@ int main(int argc, char** argv){
         }
 
         imshow("Video", frame);
-        if(waitKey(5) >= 0 ){
-            break;
-        }
+        if(waitKey(5) >= 0 ){ break; }
     }
 
     av_frame_free(&yuv);
@@ -598,12 +434,13 @@ int main(int argc, char** argv){
     // stop profiler thread
     run_profiler.store(false);
     run_sender.store(false);
-    packet_q.push(Packet{}); // unblock
+    // sender thread’i unblock et
+    struct Packet { std::vector<uint8_t> data; };
+    // zaten üstte aynı struct tanımlı; burada sadece unblock için boş push etmiştik
+    // packet_q.push(Packet{}); // eğer queue’yu hiç kullanmıyorsan yoruma alabilirsin
+
     if (sender_thread.joinable()) sender_thread.join();
     if (profiler_thread.joinable()) profiler_thread.join();
-    run_nack = false;
-    if (nack_thread.joinable()) nack_thread.join();
 
     return 0;
-
 }

@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <pthread.h>
 #include <sched.h>
+#include <array>   // <-- eklendi
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -35,9 +36,6 @@ extern "C" {
 
 using namespace std;
 
-// Simplified receiver - no shared stats needed
-// std::vector<UDPChannelStat> g_last_stats; // Removed for performance
-
 // Mirror of sender's header
 #pragma pack(push, 1)
 struct SliceHeader {
@@ -56,16 +54,7 @@ struct SliceHeader {
 #pragma pack(pop)
 
 static constexpr uint32_t SLICE_MAGIC = 0xABCD1234u;
-
-static constexpr uint16_t CTRL_NACK_PORT = 49000;
-#pragma pack(push, 1)
-struct NackPacket {
-    uint32_t magic = 0x4E41434Bu; // 'NACK'
-    uint32_t frame_id = 0;
-    uint16_t missing_count = 0;
-    uint16_t indices[128]{}; // up to 128 missing data slice indices
-};
-#pragma pack(pop)
+static constexpr uint16_t CTRL_NACK_PORT = 49000; // (şimdilik kullanılmıyor)
 
 struct FrameBuffer {
     uint32_t frame_id = 0;
@@ -77,56 +66,13 @@ struct FrameBuffer {
     std::vector<uint8_t> data_present;   // k flags
     std::vector<uint8_t> parity_present; // r flags
     std::chrono::steady_clock::time_point first_seen;
-    std::set<std::pair<uint16_t, uint16_t>> received_packets; // track (slice_index, port) to filter duplicates
-    std::chrono::steady_clock::time_point last_nack_sent{};
-    int nack_attempts = 0;
-    in_addr last_sender_ip{}; // for NACK target
+    std::set<std::pair<uint16_t, uint16_t>> received_packets; // (slice_index, port) dedup takibi
 };
 
 static inline uint64_t now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::high_resolution_clock::now().time_since_epoch())
         .count();
-}
-
-// Minimal decode-matrix generator adapted from ISA-L examples (RS matrix)
-static int gen_decode_matrix_rs(uint8_t* encode_matrix, uint8_t* decode_matrix,
-                                uint8_t* invert_matrix, uint8_t* temp_matrix,
-                                uint8_t* decode_index, uint8_t* frag_err_list,
-                                int nerrs, int k, int m) {
-    // Build matrix b from rows of encode_matrix for surviving fragments
-    std::vector<uint8_t> frag_in_err(static_cast<size_t>(m), 0);
-    int nsrcerrs = 0;
-    for (int i = 0; i < nerrs; ++i) {
-        if (frag_err_list[i] < k) nsrcerrs++;
-        frag_in_err[frag_err_list[i]] = 1;
-    }
-    int r = 0;
-    for (int i = 0; i < k; i++, r++) {
-        while (frag_in_err[r]) r++;
-        for (int j = 0; j < k; ++j) temp_matrix[k * i + j] = encode_matrix[k * r + j];
-        decode_index[i] = static_cast<uint8_t>(r);
-    }
-    if (gf_invert_matrix(temp_matrix, invert_matrix, k) < 0) return -1;
-    // Source erasures rows from invert_matrix
-    for (int i = 0; i < nerrs; ++i) {
-        if (frag_err_list[i] < k) {
-            for (int j = 0; j < k; ++j)
-                decode_matrix[k * i + j] = invert_matrix[k * frag_err_list[i] + j];
-        }
-    }
-    // Parity erasures rows: invert * encode_matrix row
-    for (int p = 0; p < nerrs; ++p) {
-        if (frag_err_list[p] >= k) {
-            for (int i = 0; i < k; ++i) {
-                uint8_t s = 0;
-                for (int j = 0; j < k; ++j)
-                    s ^= gf_mul(invert_matrix[j * k + i], encode_matrix[k * frag_err_list[p] + j]);
-                decode_matrix[k * p + i] = s;
-            }
-        }
-    }
-    return 0;
 }
 
 // Attempt to assemble a complete encoded frame into out_bytes
@@ -171,15 +117,18 @@ static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_byt
     // Choose k surviving fragment indices from actually present blocks
     std::vector<uint8_t> survive_indices;
     survive_indices.reserve(k);
-    for (int i = 0; i < k && (int)survive_indices.size() < k; ++i) if (fb.data_present[i]) survive_indices.push_back(static_cast<uint8_t>(i));
-    for (int i = 0; i < r && (int)survive_indices.size() < k; ++i) if (fb.parity_present[i]) survive_indices.push_back(static_cast<uint8_t>(k + i));
+    for (int i = 0; i < k && (int)survive_indices.size() < k; ++i)
+        if (fb.data_present[i]) survive_indices.push_back(static_cast<uint8_t>(i));
+    for (int i = 0; i < r && (int)survive_indices.size() < k; ++i)
+        if (fb.parity_present[i]) survive_indices.push_back(static_cast<uint8_t>(k + i));
     if ((int)survive_indices.size() < k) return false;
 
     // Construct temp_matrix from survive_indices rows (B)
     std::vector<uint8_t> temp_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
     for (int row = 0; row < k; ++row) {
         uint8_t idx = survive_indices[row];
-        for (int col = 0; col < k; ++col) temp_matrix[k * row + col] = a[k * idx + col];
+        for (int col = 0; col < k; ++col)
+            temp_matrix[k * row + col] = a[k * idx + col];
     }
     // Invert B
     std::vector<uint8_t> invert_matrix(static_cast<size_t>(k) * static_cast<size_t>(k));
@@ -189,7 +138,8 @@ static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_byt
     std::vector<uint8_t> decode_matrix(static_cast<size_t>(k) * static_cast<size_t>(nerrs));
     for (int e = 0; e < nerrs; ++e) {
         int err_idx = frag_err_list[e];
-        for (int j = 0; j < k; ++j) decode_matrix[k * e + j] = invert_matrix[k * err_idx + j];
+        for (int j = 0; j < k; ++j)
+            decode_matrix[k * e + j] = invert_matrix[k * err_idx + j];
     }
 
     // Prepare recover_srcs pointers from actually present fragments in survive_indices
@@ -197,12 +147,12 @@ static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_byt
     for (int row = 0; row < k; ++row) {
         uint8_t idx = survive_indices[row];
         if (idx < k) recover_srcs[row] = fb.data_blocks[idx].data();
-        else recover_srcs[row] = fb.parity_blocks[idx - k].data();
+        else         recover_srcs[row] = fb.parity_blocks[idx - k].data();
     }
     // Output buffers for recovered data blocks
     std::vector<std::vector<uint8_t>> recover_out(static_cast<size_t>(nerrs), std::vector<uint8_t>(len));
     std::vector<uint8_t*> recover_outp(static_cast<size_t>(nerrs));
-    for (int i = 0; i < nerrs; ++i) recover_outp[static_cast<size_t>(i)] = recover_out[static_cast<size_t>(i)].data();
+    for (int i = 0; i < nerrs; ++i) recover_outp[(size_t)i] = recover_out[(size_t)i].data();
 
     // Initialize g_tbls and recover
     std::vector<uint8_t> g_tbls(static_cast<size_t>(k) * static_cast<size_t>(nerrs) * 32);
@@ -211,9 +161,9 @@ static bool try_reconstruct_frame(FrameBuffer& fb, std::vector<uint8_t>& out_byt
 
     // Place recovered data blocks back to their indices
     for (int i = 0; i < nerrs; ++i) {
-        int idx = frag_err_list[static_cast<size_t>(i)];
-        fb.data_blocks[static_cast<size_t>(idx)] = std::move(recover_out[static_cast<size_t>(i)]);
-        fb.data_present[static_cast<size_t>(idx)] = 1;
+        int idx = frag_err_list[(size_t)i];
+        fb.data_blocks[(size_t)idx]  = std::move(recover_out[(size_t)i]);
+        fb.data_present[(size_t)idx] = 1;
     }
 
     // Now we should have all k data blocks
@@ -286,11 +236,9 @@ int main(int argc, char** argv) {
     for (uint16_t port : listen_ports) {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) { perror("socket"); continue; }
-        
-        // Huge receive buffer to prevent packet loss
-        int rcvbuf = 16 * 1024 * 1024; // 16MB receive buffer
+        // Büyük receive buffer
+        int rcvbuf = 16 * 1024 * 1024; // 16MB
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        
         sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
         if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(fd); continue; }
         sockets.push_back(fd);
@@ -298,7 +246,7 @@ int main(int argc, char** argv) {
     }
     if (sockets.empty()) { std::cerr << "No sockets bound" << std::endl; return 1; }
 
-    // Create NACK socket
+    // (Şimdilik kullanılmıyor) NACK socket
     int nack_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (nack_sock < 0) { perror("socket"); return 1; }
     sockaddr_in nack_addr{}; nack_addr.sin_family = AF_INET; nack_addr.sin_port = htons(CTRL_NACK_PORT); nack_addr.sin_addr.s_addr = INADDR_ANY;
@@ -317,7 +265,6 @@ int main(int argc, char** argv) {
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) { std::cerr << "H264 decoder not found" << std::endl; return 2; }
     AVCodecContext* dctx = avcodec_alloc_context3(codec);
-    // keep default decoder opts; no libavutil/opt on receiver to minimize deps
     if (avcodec_open2(dctx, codec, nullptr) < 0) { std::cerr << "decoder open failed" << std::endl; return 2; }
     AVFrame* frm = av_frame_alloc();
     AVPacket* pkt = av_packet_alloc();
@@ -327,7 +274,8 @@ int main(int argc, char** argv) {
     struct ImgTask { int w; int h; int fmt; std::array<uint8_t*,4> data; std::array<int,4> linesize; };
     std::mutex q_mtx; std::condition_variable q_cv; std::deque<ImgTask> img_q;
     std::atomic<bool> run_workers{true};
-    unsigned worker_threads = std::min<unsigned>(4, std::max(2u, std::thread::hardware_concurrency()/3));
+    unsigned hw = std::max(2u, std::thread::hardware_concurrency());
+    unsigned worker_threads = std::min<unsigned>(16, std::max<unsigned>(6, hw));
     std::vector<std::thread> workers;
     workers.reserve(worker_threads);
     for (unsigned t=0; t<worker_threads; ++t) {
@@ -361,19 +309,17 @@ int main(int argc, char** argv) {
     }
 
     std::unordered_map<uint32_t, FrameBuffer> frames;
-    // Smart buffer window depends on number of ports: more ports -> slightly larger window
-    int num_ports = static_cast<int>(listen_ports.size());
-    int buffer_ms = (num_ports <= 1) ? 20 : (num_ports <= 3 ? 35 : 45);
+    int num_ports = (int)listen_ports.size();
+    int buffer_ms = (num_ports <= 1) ? 60 : (num_ports <= 3 ? 80 : 90);
     std::chrono::milliseconds frame_timeout{buffer_ms};
 
     cv::namedWindow("NovaEngine Receiver", cv::WINDOW_AUTOSIZE);
 
-    size_t rxbuf_capacity = std::max<size_t>(mtu, 4096); // Bigger receive buffer
+    size_t rxbuf_capacity = std::max<size_t>(mtu, 4096);
     std::vector<uint8_t> rxbuf(rxbuf_capacity);
     epoll_event events[32];
 
     while (true) {
-        // epoll poll time aligned with buffer
         int nfds = epoll_wait(epfd, events, 32, std::max(5, buffer_ms / 3));
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
@@ -385,7 +331,6 @@ int main(int argc, char** argv) {
             if (n == (ssize_t)sizeof(UdpProbe)) {
                 UdpProbe pr{}; std::memcpy(&pr, rxbuf.data(), sizeof(pr));
                 if (pr.validate()) {
-                    // echo back
                     sendto(fd, &pr, sizeof(pr), 0, (sockaddr*)&from, fromlen);
                     continue;
                 }
@@ -394,100 +339,66 @@ int main(int argc, char** argv) {
             if (n < (ssize_t)sizeof(SliceHeader)) continue;
             SliceHeader sh{}; std::memcpy(&sh, rxbuf.data(), sizeof(SliceHeader));
             if (sh.magic != SLICE_MAGIC) continue;
-            const size_t recv_payload = static_cast<size_t>(n) - header_size;
+            const size_t recv_payload = (size_t)n - sizeof(SliceHeader);
 
             // Initialize frame buffer if first time
             auto& fb = frames[sh.frame_id];
             if (fb.k == 0) {
                 fb.frame_id = sh.frame_id;
                 fb.k = sh.k_data; fb.r = sh.r_parity; fb.m = sh.total_slices;
-                // Trust sender-advertised payload_bytes to avoid MTU mismatch
                 size_t alloc_payload = sh.payload_bytes ? sh.payload_bytes : payload_size_default;
-                fb.payload_size = static_cast<uint16_t>(alloc_payload);
+                fb.payload_size = (uint16_t)alloc_payload;
                 fb.total_frame_bytes = sh.total_frame_bytes;
                 fb.data_blocks.assign(fb.k, std::vector<uint8_t>(fb.payload_size));
                 fb.parity_blocks.assign(fb.r, std::vector<uint8_t>(fb.payload_size));
                 fb.data_present.assign(fb.k, 0);
                 fb.parity_present.assign(fb.r, 0);
                 fb.first_seen = std::chrono::steady_clock::now();
-                fb.last_sender_ip = from.sin_addr;
-                fb.last_nack_sent = fb.first_seen - std::chrono::milliseconds(1000);
-                fb.nack_attempts = 0;
-            } else {
-                fb.last_sender_ip = from.sin_addr;
             }
-            
-            // Check for duplicate packets from multiple tunnels
-            uint16_t recv_port = ntohs(from.sin_port);
-            auto packet_id = std::make_pair(sh.slice_index, recv_port);
-            
-            // Skip if we already have this slice (from any tunnel)
+
+            // Dedup: bu slice zaten varsa atla
             if ((sh.slice_index < fb.k && fb.data_present[sh.slice_index]) ||
-                (sh.slice_index >= fb.k && sh.slice_index - fb.k < fb.r && fb.parity_present[sh.slice_index - fb.k])) {
-                continue; // Already have this slice, skip duplicate
+                (sh.slice_index >= fb.k && (sh.slice_index - fb.k) < fb.r &&
+                 fb.parity_present[sh.slice_index - fb.k])) {
+                continue;
             }
-            
+
             const uint8_t* payload = rxbuf.data() + sizeof(SliceHeader);
             if (sh.slice_index < fb.k) {
                 size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
                 std::memcpy(fb.data_blocks[sh.slice_index].data(), payload, copy_len);
                 // checksum validation
-                uint32_t h = 2166136261u; for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.data_blocks[sh.slice_index][i]; h *= 16777619u; }
+                uint32_t h = 2166136261u;
+                for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.data_blocks[sh.slice_index][i]; h *= 16777619u; }
                 if (h == sh.checksum) {
                     fb.data_present[sh.slice_index] = 1;
-                    fb.received_packets.insert(packet_id);
+                    fb.received_packets.insert({sh.slice_index, ntohs(from.sin_port)});
                 }
             } else {
-                uint16_t pi = static_cast<uint16_t>(sh.slice_index - fb.k);
+                uint16_t pi = (uint16_t)(sh.slice_index - fb.k);
                 if (pi < fb.r) {
                     size_t copy_len = std::min<size_t>(fb.payload_size, recv_payload);
                     std::memcpy(fb.parity_blocks[pi].data(), payload, copy_len);
-                    uint32_t h = 2166136261u; for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.parity_blocks[pi][i]; h *= 16777619u; }
+                    uint32_t h = 2166136261u;
+                    for (size_t i=0;i<fb.payload_size;++i){ h ^= fb.parity_blocks[pi][i]; h *= 16777619u; }
                     if (h == sh.checksum) {
                         fb.parity_present[pi] = 1;
-                        fb.received_packets.insert(packet_id);
+                        fb.received_packets.insert({sh.slice_index, ntohs(from.sin_port)});
                     }
                 }
             }
 
-            // After updating presence, evaluate NACK need for data slices
-            int have_data = 0; for (int di = 0; di < fb.k; ++di) have_data += fb.data_present[di] ? 1 : 0;
-            int present_total = have_data; for (int pi = 0; pi < fb.r; ++pi) present_total += fb.parity_present[pi] ? 1 : 0;
-            bool complete_or_recoverable = (have_data == fb.k) || (present_total >= fb.k);
-            auto nowtp = std::chrono::steady_clock::now();
-            auto since_first = std::chrono::duration_cast<std::chrono::milliseconds>(nowtp - fb.first_seen).count();
-            auto since_last_nack = std::chrono::duration_cast<std::chrono::milliseconds>(nowtp - fb.last_nack_sent).count();
-            if (!complete_or_recoverable && since_first >= 8 && since_last_nack >= 8 && fb.nack_attempts < 4) {
-                // Build NACK for missing data slices only (0..k-1)
-                NackPacket nack{};
-                nack.frame_id = fb.frame_id;
-                nack.missing_count = 0;
-                for (uint16_t di = 0; di < fb.k && nack.missing_count < 128; ++di) {
-                    if (!fb.data_present[di]) {
-                        nack.indices[nack.missing_count++] = di;
-                    }
-                }
-                if (nack.missing_count > 0) {
-                    sockaddr_in to{}; to.sin_family = AF_INET; to.sin_port = htons(CTRL_NACK_PORT); to.sin_addr = fb.last_sender_ip;
-                    sendto(nack_sock, &nack, sizeof(nack), 0, (sockaddr*)&to, sizeof(to));
-                    fb.last_nack_sent = nowtp;
-                    fb.nack_attempts++;
-                }
-            }
-            
-             // Try reconstruct
+            // Try reconstruct
             std::vector<uint8_t> complete;
             if (try_reconstruct_frame(fb, complete)) {
-                // Feed entire access unit directly (fps düşük, payload Annex B)
                 av_packet_unref(pkt);
-                if (av_new_packet(pkt, static_cast<int>(complete.size())) == 0) {
+                if (av_new_packet(pkt, (int)complete.size()) == 0) {
                     std::memcpy(pkt->data, complete.data(), complete.size());
                 } else {
                     continue;
                 }
                 if (avcodec_send_packet(dctx, pkt) == 0) {
                     while (avcodec_receive_frame(dctx, frm) == 0) {
-                        // Enqueue for workers
                         ImgTask task{}; task.w = frm->width; task.h = frm->height; task.fmt = frm->format;
                         for (int p=0;p<4;++p){ task.data[p]=frm->data[p]; task.linesize[p]=frm->linesize[p]; }
                         {
@@ -515,12 +426,9 @@ int main(int argc, char** argv) {
     if (sws) sws_freeContext(sws);
     av_frame_free(&frm);
     av_packet_free(&pkt);
-    // no parser in use
     avcodec_free_context(&dctx);
     for (int fd : sockets) close(fd);
     close(epfd);
     if (nack_sock >= 0) close(nack_sock);
     return 0;
 }
-
-

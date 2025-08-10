@@ -21,13 +21,15 @@ struct UDPChannelStat {
     size_t received = 0;
 
     void update(bool success, double rtt_ms) {
+        // 'sent' bu turda probe yollandığını temsil eder
         sent++;
         if (success) {
             received++;
             avg_rtt_ms = 0.8 * avg_rtt_ms + 0.2 * rtt_ms;
         }
-        if (sent > 0)
-            packet_loss = 1.0 - (double(received) / sent);
+        if (sent > 0) {
+            packet_loss = 1.0 - (double(received) / (double)sent);
+        }
     }
 };
 
@@ -35,20 +37,18 @@ struct UDPChannelStat {
 #pragma pack(push, 1)
 struct UdpProbe {
     uint32_t magic = 0xDEADBEEF;
-    uint16_t port;
-    uint64_t timestamp_us;
+    uint16_t port = 0;
+    uint64_t timestamp_us = 0;
 
     void fill(uint16_t p) {
-        memset(this, 0, sizeof(*this));
+        std::memset(this, 0, sizeof(*this));
         magic = 0xDEADBEEF;
         port = p;
         auto now = std::chrono::high_resolution_clock::now();
-        timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+        timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           now.time_since_epoch()).count();
     }
-
-    bool validate() const {
-        return magic == 0xDEADBEEF;
-    }
+    bool validate() const { return magic == 0xDEADBEEF; }
 };
 #pragma pack(pop)
 static_assert(sizeof(UdpProbe) == 14, "UdpProbe boyutu beklenmedik!");
@@ -74,7 +74,7 @@ UDPPortProfiler::UDPPortProfiler(const std::string& ip, const std::vector<uint16
     : target_ip_(ip)
 {
     for (auto port : ports) {
-        UDPChannelStat stat;
+        UDPChannelStat stat{};
         stat.port = port;
         stats_.emplace_back(stat);
 
@@ -85,9 +85,8 @@ UDPPortProfiler::UDPPortProfiler(const std::string& ip, const std::vector<uint16
             continue;
         }
 
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
+        // recv timeout (epoll kullansak da güvenli)
+        timeval tv{}; tv.tv_sec = 1; tv.tv_usec = 0;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         sockets_.emplace_back(sock);
@@ -107,18 +106,19 @@ void UDPPortProfiler::send_probes() {
         int sock = sockets_[i];
         if (sock < 0) continue;
 
-        UdpProbe probe;
-        probe.fill(stats_[i].port);
+        UdpProbe probe; probe.fill(stats_[i].port);
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(stats_[i].port);
+        addr.sin_port   = htons(stats_[i].port);
         inet_pton(AF_INET, target_ip_.c_str(), &addr.sin_addr);
 
-        ssize_t sent = sendto(sock, &probe, sizeof(probe), 0, (sockaddr*)&addr, sizeof(addr));
-        if (sent != sizeof(probe)) {
+        ssize_t sent_bytes = sendto(sock, &probe, sizeof(probe), 0,
+                                    (sockaddr*)&addr, sizeof(addr));
+        if (sent_bytes != (ssize_t)sizeof(probe)) {
             perror(("sendto failed for port " + std::to_string(stats_[i].port)).c_str());
         }
+        // Not: sent sayacı receive aşamasında update(false/true) ile artacak.
     }
 }
 
@@ -134,9 +134,7 @@ void UDPPortProfiler::receive_replies_epoll(int timeout_ms) {
 
     for (int sock : sockets_) {
         if (sock < 0) continue;
-        epoll_event ev{};
-        ev.events = EPOLLIN;
-        ev.data.fd = sock;
+        epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = sock;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, sock, &ev) < 0) {
             perror("epoll_ctl");
         }
@@ -147,43 +145,43 @@ void UDPPortProfiler::receive_replies_epoll(int timeout_ms) {
 
     int nfds = epoll_wait(epfd, events, MAX_EVENTS, timeout_ms);
 
+    // Bu turda yanıt alan portları işaretlemek için
+    std::vector<bool> got_reply(stats_.size(), false);
+
     for (int i = 0; i < nfds; ++i) {
         int sock = events[i].data.fd;
 
-        sockaddr_in from{};
-        socklen_t from_len = sizeof(from);
-        char buffer[1024];
+        sockaddr_in from{}; socklen_t from_len = sizeof(from);
+        char buffer[1024]{};
 
-        auto t1 = Clock::now();
-        ssize_t len = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&from, &from_len);
-        auto t2 = Clock::now();
+        ssize_t len = recvfrom(sock, buffer, sizeof(buffer), 0,
+                               (sockaddr*)&from, &from_len);
+        if (len != (ssize_t)sizeof(UdpProbe)) continue;
 
-        if (len != sizeof(UdpProbe)) continue;
-
-        UdpProbe reply;
-        memcpy(&reply, buffer, sizeof(reply));
+        UdpProbe reply{};
+        std::memcpy(&reply, buffer, sizeof(reply));
         if (!reply.validate()) continue;
 
-        double rtt_ms = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.0;
+        // RTT'yi probe içindeki timestamp ile ölç
+        auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          Clock::now().time_since_epoch()).count();
+        double rtt_ms = (now_us - (double)reply.timestamp_us) / 1000.0;
 
-        for (auto& stat : stats_) {
-            if (stat.port == reply.port) {
-                stat.update(true, rtt_ms);
+        // ilgili istatistiği güncelle
+        for (size_t idx = 0; idx < stats_.size(); ++idx) {
+            if (stats_[idx].port == reply.port) {
+                stats_[idx].update(true, rtt_ms);
+                got_reply[idx] = true;
                 break;
             }
         }
     }
 
+    // Yanıt alamayanlar için (loss say)
     for (size_t i = 0; i < sockets_.size(); ++i) {
-        int sock = sockets_[i];
-        bool found = false;
-        for (int j = 0; j < nfds; ++j) {
-            if (events[j].data.fd == sock) {
-                found = true;
-                break;
-            }
+        if (!got_reply[i]) {
+            stats_[i].update(false, 0.0);
         }
-        if (!found) stats_[i].update(false, 0);
     }
 
     close(epfd);
