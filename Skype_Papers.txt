@@ -1,0 +1,132 @@
+-I should also study KaZaA about file sharing over P2P.
+-I must look at #3 and #4 parts in this papers.
++What is a VoID-PSTN Gateways.
++Skype also used KaZaA Technology directly and improve those.
+--KaZaA:
+Network packet level analysis Used in Skype directly
+And also Skype Used SuperNode based hierarchical peer to peer network.
+
+--Super Node-Based peer to peer networks organize participants
+into rwo layers:
++Super Nodes
++Ordinary Nodes
+
+Typically, supernodes maintain an overlay network among themselves, while ordinary nodes pick one
+(or a small number of) supernodes to associate with; supernodes also function as ordinary nodes and are elected from
+amongst them based on some criteria. Ordinary nodes issue
+queries through the supernode(s) they are associated with.
+
+                  SUPERNODE OVERLAY (mesh)
+              +-----------+     +-----------+
+              |  [S1]*    |-----|   [S2]*   |\
+              +-----------+ \   +-----------+ \
+                 |  \        \     /   \       \
+                 |   \        \   /     \       \
+                 |    \      +-----------+     +-----------+
+                 |     \-----|   [S3]*   |-----|   [S4]*   |
+                 |            +-----------+     +-----------+
+                 |                  \               /
+                 |                   \             /
+                 |                    \           /
+                 |                   +-----------+
+                 |                   |   [S5]*   |
+                 |                   +-----------+
+
+  (* Supernode’lar aynı zamanda ordinary node gibi davranır ve
+     belirli ölçütlere göre ordinary’lerden seçilir/atanır.)
+
+  ORDINARY NODE ASSOCIATIONS (her biri 1 veya az sayıda supernode’a bağlanır)
+
+        [N1]----\
+                  \                [N6]----\
+        [N2]------ \                |        \
+                    \               |         \ 
+        [N3]--------->[S1]          |          >---->[S3]
+                    /               |         /
+        [N4]------/                 |        /
+                                   [N7]----/
+        [N5]------------------------>[S2]                  [N12]-->[S5]
+             \                       ^
+              \                      |
+               \                  (dual-homed)
+                \---------------->[S4]
+
+  ÖRNEK SORGU AKIŞI
+  -----------------------------------------------------------------
+  [N7] ---> [S2] ===overlay===> [S5] ---> [N12]
+            (ilişkili SN)        (hedefin bağlı olduğu SN)
+
+  Açıklama:
+  - Ordinary node’lar (N1, N2, ...) ilişkili oldukları supernode’lara istek yollar.
+  - Supernode’lar arası overlay mesh’i üzerinden uygun supernode’a aktarılır.
+  - Hedef ordinary node’a, hedefin bağlı olduğu supernode üzerinden ulaşılır.
+  - Bazı ordinary’ler (N7 gibi) dayanıklılık/performans için birden fazla supernode’a (dual-homing) bağlanabilir.
+
+
+[Client A] ---control---> [Supernode Overlay] <---control--- [Client B]
+       \__________________________DIRECT MEDIA________________________/
+                   (VoIP / File Transfer - NAT yok)
+
+Case: Client B behind NAT
+[Client A] ----control----> [Supernode Overlay] <----control---- [Client B]
+                                     |
+                                     |  NAT Traversal: Connection Reversal
+                                     v
+       (NAT tarafı başlatır)   --->  [NAT]
+                                      |
+                                      v
+          ---------DIRECT MEDIA SESSION--------->
+[Client A] <===================================> [Client B]
+
+
+STEP 1: STUN-like Traversal Attempt
+[Client A]---UDP Punch---> [STUN/Peer SN] <---UDP Punch---[Client B]
+       \_________________________________________________/
+                     Eğer başarılı → DIRECT MEDIA
+
+STEP 2: TURN-like Fallback (relay)
+[Client A] ===media===> [Supernode Relay] ===media===> [Client B]
+
+               +---------------------------+
+               |  Control via Supernodes   |
+               +---------------------------+
+                         |
+   +---------------------+-----------------------+
+   |                     |                       |
+ NAT Yok          Tek NAT (Reversal)       Çift NAT
+ Direct P2P       NAT içinden başlatır      STUN → TURN fallback
+
+
+[Client] ---> [Skype Login Server] ---> OK → Session Token
+                   (Microsoft öncesi dönemde, Skype Ltd.'nin kendi DC'si)
+
+--Skype didn't used DB Server as a Signaling Center--
+//This was part of the Control Plane//
+
+
+Skype--
+[Auth Server] → sadece Login/Register
+      |
+      v
+[Supernode Mesh] → Signaling (IP/port exchange, presence)
+      |
+      v
+[P2P Media]
+
+SafeRoom--
+[Auth+Signaling Server] → Login + IP exchange + presence
+      |
+      v
+[P2P Media]
+
+------- Promotion to SuperNode ---------
++An Ordinary Node that Behind NAT --> Did not become Super Node
+
++An Ordinary Node with saturated network uplink --> Did not become Super Node
+
++An Ordinary Node with fresh install
+on a public host with a 10 Mbps connection -->Become a Super Node in minutes
+
+This is show that Skype supernodes are chosen from nodes that have a plenty
+of spare bandwidth and publicly reachable.
+
